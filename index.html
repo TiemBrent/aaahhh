@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rhythia Web</title>
+<link rel="icon" href="skin_RhythiaSquircle.png">
+<style>
+/* ── Fonts ─────────────────────────────────────────────────── */
+@font-face{font-family:Ubuntu;src:url(Ubuntu-Medium.ttf);font-weight:500}
+@font-face{font-family:Ubuntu;src:url(Ubuntu-Regular.ttf);font-weight:400}
+@font-face{font-family:Comfortaa;src:url(Comfortaa-Bold.ttf);font-weight:700}
+@font-face{font-family:Roboto;src:url(Roboto-Bold.ttf);font-weight:700}
+
+/* ── Base ──────────────────────────────────────────────────── */
+:root{
+  --bg: rgb(6,5,9);      /* main_menu.tscn Background Color(0.0235,0.0196,0.0353) */
+  --acc: rgb(201,0,69);  /* Color(0.7882,0,0.2706) */
+  --acc2: rgb(255,216,230);
+  --btn-normal: rgba(0,0,0,0.471);
+  --btn-hover:  rgba(26,26,26,0.314);  /* Color(0.1,0.1,0.1,0.314) */
+  --muted: rgba(160,160,160,1);        /* Color(0.627,0.627,0.627,1) */
+  --dim:   rgba(255,255,255,0.25);
+  --r: 3px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:#fff;font-family:Ubuntu,sans-serif}
+
+/* ── Z-layers ───────────────────────────────────────────────
+   #bg-canvas=1  canvas#c=2  #hud=5  .screen=10  .modal=20
+   #countdown=25  #scr-loading=30  #toast=50              */
+#bg-canvas{position:fixed;inset:0;z-index:1;pointer-events:none}
+canvas#c  {display:block;position:fixed;inset:0;z-index:2}
+
+/* ═══════════════════════════════════════════════════════════
+   GAMEPLAY HUD
+   ═══════════════════════════════════════════════════════════ */
+#hud{display:none;position:fixed;inset:0;pointer-events:none;z-index:5}
+
+/* Side panels: 250×625 SubViewports on 10°-rotated 3D quads */
+#panel-left{
+  position:absolute;left:0;top:50%;
+  transform:translateY(-50%) perspective(600px) rotateY(10deg);
+  transform-origin:left center;
+  width:200px;height:500px;
+  background:url(skin_panel_left_background.png) no-repeat center/100% 100%;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px
+}
+#panel-right{
+  position:absolute;right:0;top:50%;
+  transform:translateY(-50%) perspective(600px) rotateY(-10deg);
+  transform-origin:right center;
+  width:200px;height:500px;
+  background:url(skin_panel_right_background.png) no-repeat center/100% 100%;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px
+}
+/* Score: LabelSettings_usmyc font_size=50, Comfortaa */
+#hud-score{font-family:Comfortaa,sans-serif;font-size:36px;font-weight:700;text-align:center;letter-spacing:1px}
+/* Multiplier ring */
+#ring-wrap{position:relative;width:108px;height:108px}
+#ring-cv  {display:block;width:108px;height:108px}
+#hud-mult {position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+           font-family:Comfortaa,sans-serif;font-size:28px;font-weight:700}
+/* Accuracy: same 50px Comfortaa */
+#hud-acc{font-family:Comfortaa,sans-serif;font-size:32px;font-weight:700}
+#hm-row {display:flex;align-items:center;gap:2px;margin-top:2px}
+.hm-ico {width:16px;height:16px;background:no-repeat center/contain;opacity:.65}
+#ico-hits{background-image:url(skin_hits.png)}
+#ico-miss{background-image:url(skin_misses.png)}
+/* Hits/Misses: LabelSettings_5bid2/v63ri font_size=30, Color(1,1,1,0.627) */
+#hud-hits,#hud-miss{font-family:Comfortaa,sans-serif;font-size:20px;color:rgba(255,255,255,.627)}
+#hm-sep {color:var(--dim);margin:0 2px;font-size:13px}
+/* ColorRect separator at anchor_top=0.65 */
+.pdiv{width:80%;height:1px;background:rgba(255,255,255,.15);margin:3px 0}
+/* Sum: font_size=50 Comfortaa */
+#hud-sum{font-family:Comfortaa,sans-serif;font-size:28px;font-weight:700}
+
+/* Health bar: 3D tilted MeshInstance at y=-6.3, rotateX(15°) */
+#health-wrap{
+  position:absolute;bottom:30px;left:50%;
+  transform:translateX(-50%) perspective(900px) rotateX(15deg);
+  width:min(870px,calc(100vw - 220px));height:40px;overflow:hidden
+}
+#health-bg  {position:absolute;inset:0;background:url(skin_health_background.png) left/100% 100% no-repeat}
+#health-fill{position:absolute;top:0;left:0;height:100%;width:100%;
+             background:url(skin_health.png) left/100% 100% no-repeat;transition:width .05s linear}
+
+/* Progress bar: 3D tilted at y=6.3, rotateX(-15°) */
+#prog-wrap{
+  position:absolute;top:30px;left:50%;
+  transform:translateX(-50%) perspective(900px) rotateX(-15deg);
+  width:min(870px,calc(100vw - 220px));height:40px;overflow:hidden
+}
+#prog-bg  {position:absolute;inset:0;background:url(skin_progress_background.png) left/100% 100% no-repeat}
+#prog-fill{position:absolute;top:0;left:0;height:100%;width:0%;
+           background:url(skin_progress.png) left/100% 100% no-repeat;transition:width .08s linear}
+
+#song-title{position:absolute;top:82px;left:50%;transform:translateX(-50%);
+            font-family:Ubuntu,sans-serif;font-size:15px;font-weight:500;letter-spacing:.5px;
+            white-space:nowrap;text-shadow:0 1px 12px rgba(0,0,0,.9)}
+#song-time {position:absolute;top:102px;left:50%;transform:translateX(-50%);
+            font-family:Ubuntu,sans-serif;font-size:12px;color:rgba(255,255,255,.6);
+            text-shadow:0 1px 8px rgba(0,0,0,.9)}
+#skip-lbl  {position:absolute;bottom:84px;left:50%;transform:translateX(-50%);
+            font-size:14px;color:rgba(255,255,255,.7);letter-spacing:2px;
+            opacity:0;pointer-events:none;white-space:nowrap;text-shadow:0 0 14px rgba(255,255,255,.35)}
+
+/* Combo: Label3D at y=3.5, font_size=64 — starts at modulate=Color(1,1,1,0) */
+#combo-wrap{position:absolute;bottom:90px;left:50%;transform:translateX(-50%);
+            text-align:center;pointer-events:none}
+#hud-combo {font-family:Ubuntu,sans-serif;font-size:72px;font-weight:500;line-height:1;
+            color:rgba(255,255,255,0);text-shadow:0 0 40px rgba(255,255,255,.16)}
+#hud-combo.pop{animation:cpop .12s ease-out forwards}
+@keyframes cpop{0%{transform:scale(1.18)}100%{transform:scale(1)}}
+
+/* SimpleMisses: LabelSettings_g4ffu font_size=50, Color(1,1,1,0.769), centered */
+#simple-miss-wrap{display:none;position:absolute;top:50%;left:50%;
+                  transform:translate(-50%,-50%);pointer-events:none;text-align:center}
+#simple-miss{font-family:Comfortaa,sans-serif;font-size:52px;font-weight:700;color:rgba(255,255,255,.77)}
+
+#fps-el{position:fixed;top:8px;right:8px;z-index:8;font-size:11px;color:var(--dim);
+        letter-spacing:1px;pointer-events:none}
+
+#popups{position:fixed;inset:0;pointer-events:none;z-index:8}
+.hit-popup{position:absolute;transform:translate(-50%,-50%);font-family:Ubuntu,sans-serif;
+           font-size:17px;font-weight:500;color:#fff;text-shadow:0 0 10px rgba(255,255,255,.6);
+           opacity:0;pointer-events:none;white-space:nowrap}
+.hit-popup.rise{animation:hrise .45s ease-out forwards}
+@keyframes hrise{0%{opacity:1;transform:translate(-50%,-50%) translateY(0)}
+                 100%{opacity:0;transform:translate(-50%,-50%) translateY(-28px)}}
+.miss-icon{position:absolute;transform:translate(-50%,-50%);width:28px;height:28px;
+           background:url(skin_miss_feedback.png) no-repeat center/contain;opacity:0;pointer-events:none}
+.miss-icon.fall{animation:mfall .38s ease-in forwards}
+@keyframes mfall{0%{opacity:.85;transform:translate(-50%,-50%) translateY(0) scale(1)}
+                 100%{opacity:0;transform:translate(-50%,-50%) translateY(22px) scale(.65)}}
+#dead-ov{display:none;position:fixed;inset:0;z-index:12;background:rgba(100,0,0,.3);
+         pointer-events:none;animation:deadf .4s ease-out forwards}
+@keyframes deadf{0%{opacity:1}100%{opacity:0}}
+
+/* ═══════════════════════════════════════════════════════════
+   SHARED LAYOUT COMPONENTS
+   ═══════════════════════════════════════════════════════════ */
+.screen{position:fixed;inset:0;z-index:10;display:none}
+
+/* TopBar: 72px tall, blur bg — from main_menu.tscn TopBar */
+.topbar{
+  position:absolute;top:0;left:0;right:0;height:72px;
+  background:rgba(6,5,9,.82);backdrop-filter:blur(12px);
+  display:flex;align-items:center;padding:0 16px;gap:10px;z-index:2
+}
+.tb-logo{width:52px;height:52px;flex-shrink:0;background:url(skin_RhythiaSquircle.png) no-repeat center/contain}
+/* Version: "Rhythia [Ubuntu-Medium 18px]" + "early-26feb22 [12px, 0xa0 opacity]" */
+.tb-version{font-family:Ubuntu,sans-serif;font-size:18px;font-weight:500}
+.tb-version small{font-size:12px;color:rgba(255,255,255,.627);margin-left:5px}
+/* Center nav: Home/Play/Extras, font_size=18, flat */
+.tb-nav{position:absolute;left:25%;right:25%;display:flex;align-items:center;justify-content:center;height:100%}
+.tb-nav-btn{background:none;border:none;color:rgba(255,255,255,.7);font-family:Ubuntu,sans-serif;
+            font-size:18px;padding:0 20px;height:100%;cursor:pointer;transition:color .1s;letter-spacing:.3px}
+.tb-nav-btn:hover{color:#fff}.tb-nav-btn.active{color:#fff}
+/* Right: link icon buttons */
+.tb-links{margin-left:auto;display:flex;align-items:center;gap:6px}
+.tb-icon{width:36px;height:36px;background:rgba(255,255,255,.06);border:none;border-radius:4px;
+         cursor:pointer;display:flex;align-items:center;justify-content:center;
+         transition:background .1s;flex-shrink:0;text-decoration:none}
+.tb-icon:hover{background:rgba(255,255,255,.12)}
+.tb-icon img{width:20px;height:20px;opacity:.7}
+
+/* Jukebox: bottom 72px — from JukeboxPanel anchor_top=1, offset_top=-72 */
+#jukebox{
+  position:absolute;bottom:0;left:0;right:0;height:72px;
+  background:rgba(6,5,9,.82);backdrop-filter:blur(12px);
+  display:flex;align-items:center;padding:0 16px;gap:10px;z-index:2
+}
+#jukebox-title{flex:1;font-family:Ubuntu,sans-serif;font-size:14px;color:rgba(255,255,255,.75);
+               white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+               background:rgba(0,0,0,.38);border-radius:4px;padding:4px 12px}
+.juke-btn{background:none;border:none;color:rgba(255,255,255,.75);cursor:pointer;
+          font-size:16px;padding:6px 8px;transition:color .1s;border-radius:3px}
+.juke-btn:hover{color:#fff;background:rgba(255,255,255,.07)}
+
+/* ═══════════════════════════════════════════════════════════
+   MAIN MENU
+   ═══════════════════════════════════════════════════════════ */
+#scr-menu{display:none}
+
+/* Left nav buttons: offset_left=64, width=336, Roboto 32px
+   StyleBoxFlat: bg=rgba(0,0,0,0.471), hover border-left accent + rgba(26,26,26,0.314) */
+#menu-nav{position:absolute;left:64px;top:72px;bottom:72px;width:336px;
+          display:flex;flex-direction:column;justify-content:center;gap:2px}
+.menu-nav-btn{
+  background:rgba(0,0,0,.471);border:none;border-left:2px solid transparent;
+  color:#fff;font-family:Roboto,sans-serif;font-size:32px;font-weight:700;
+  text-align:left;padding:12px 18px 12px 16px;cursor:pointer;letter-spacing:.5px;
+  border-radius:0 var(--r) var(--r) 0;transition:all .1s
+}
+.menu-nav-btn:hover{background:rgba(26,26,26,.314);border-left-color:var(--acc)}
+.menu-nav-btn:active{background:rgba(26,26,26,.5)}
+
+/* News panel: anchor to right side, 536px wide, blur shader brightness=0.5
+   StyleBoxFlat: bg=Color(0.1,0.1,0.1,0.6), corner_radius=3 */
+#menu-news{
+  position:absolute;right:64px;top:80px;bottom:80px;width:min(536px,55vw);
+  background:rgba(26,26,26,.6);backdrop-filter:blur(8px);
+  border-radius:var(--r);display:flex;flex-direction:column;overflow:hidden
+}
+.news-head{font-family:Roboto,sans-serif;font-size:24px;font-weight:700;text-align:center;
+           padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06)}
+.news-body{flex:1;overflow-y:auto;padding:14px 18px;font-size:14px;line-height:1.75;
+           color:rgba(255,255,255,.8);scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.1) transparent}
+.news-body h3{font-family:Roboto,sans-serif;font-size:19px;color:#fff;margin:10px 0 4px}
+.news-body p{margin-bottom:2px}
+
+/* ═══════════════════════════════════════════════════════════
+   PLAY SCREEN
+   ═══════════════════════════════════════════════════════════ */
+#scr-play{display:none}
+#scr-play.drag-over{outline:3px dashed var(--acc);outline-offset:-3px}
+#play-tile{position:absolute;inset:0;z-index:0;background:url(ui_background_tile.png) repeat;
+           opacity:.35;animation:tile 4s linear infinite}
+@keyframes tile{to{background-position:200px 0}}
+
+/* SubTopBar: top=72, height=56, right-aligned buttons */
+#sub-top{position:absolute;left:8px;right:8px;top:72px;height:56px;z-index:2;
+         display:flex;align-items:center;gap:4px;padding:0 4px}
+.sub-sep{width:1px;height:32px;background:rgba(255,255,255,.125);margin:0 6px}
+.sub-btn{background:none;border:none;color:rgba(255,255,255,.8);font-family:Ubuntu,sans-serif;
+         font-size:14px;padding:4px 10px;height:36px;cursor:pointer;display:flex;align-items:center;
+         gap:5px;border-radius:var(--r);white-space:nowrap;transition:background .1s}
+.sub-btn:hover{background:rgba(255,255,255,.08)}
+.sub-btn img{width:16px;height:16px;opacity:.65}
+/* Search boxes: StyleBoxFlat_68b7m bg=rgba(0,0,0,1) corner_radius=4 */
+#search-box,#search-author-box{
+  background:rgba(0,0,0,1);border:1px solid rgba(18,18,18,1);
+  border-radius:4px;padding:4px 8px 4px 28px;color:#fff;font-family:Ubuntu,sans-serif;
+  font-size:14px;outline:none;height:36px
+}
+#search-box{min-width:120px;max-width:200px}
+#search-author-box{min-width:100px;max-width:150px}
+#search-box::placeholder,#search-author-box::placeholder{color:rgba(255,255,255,.3)}
+.search-wrap{position:relative;display:flex;align-items:center}
+.search-wrap img{position:absolute;left:7px;width:15px;height:15px;opacity:.4;pointer-events:none}
+
+/* Map info: anchor_left=0.05, anchor_right=0.45, top=128, bottom=-80
+   StyleBoxFlat_764ux: bg=rgba(0,0,0,0.471), border-left 2px accent */
+#map-info{
+  position:absolute;left:calc(5% + 8px);top:128px;bottom:80px;
+  width:calc(40% - 16px);
+  background:rgba(0,0,0,.471);border-radius:2px 8px 8px 2px;
+  border-left:2px solid var(--acc);
+  padding:16px;display:flex;flex-direction:column;gap:6px;z-index:1;
+  overflow-y:auto;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.1) transparent;
+  backdrop-filter:blur(4px)
+}
+.mi-cover{width:100%;aspect-ratio:1;background:rgba(255,255,255,.06);border-radius:3px;
+          margin-bottom:3px;display:flex;align-items:center;justify-content:center;
+          color:var(--dim);font-size:12px;letter-spacing:2px;overflow:hidden}
+.mi-cover img{width:100%;height:100%;object-fit:cover}
+#mi-title {font-family:Comfortaa,sans-serif;font-size:22px;font-weight:700}
+#mi-diff  {font-size:14px;color:var(--muted);margin-top:1px}
+#mi-mapper{font-size:11px;color:var(--dim)}
+.mi-div   {height:1px;background:rgba(255,255,255,.08);margin:2px 0;flex-shrink:0}
+.mi-row   {display:flex;justify-content:space-between;font-size:13px;color:var(--muted)}
+.mi-row span:last-child{color:#fff}
+.sg{display:flex;flex-direction:column;gap:5px;margin-top:2px}
+.sr{display:flex;align-items:center;gap:8px}
+.sl{font-size:10px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;
+    min-width:80px;flex-shrink:0;font-family:Ubuntu,sans-serif}
+input[type=range]{-webkit-appearance:none;flex:1;height:2px;background:rgba(255,255,255,.12);outline:none;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--acc);border-radius:50%;cursor:pointer;box-shadow:0 0 6px rgba(201,0,69,.5)}
+.sn{font-size:10px;color:var(--acc);min-width:30px;text-align:right;font-family:Ubuntu,sans-serif}
+.mod-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+.mod-btn{background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.15);color:var(--muted);
+         cursor:pointer;font-family:Ubuntu,sans-serif;font-size:12px;letter-spacing:1px;
+         padding:5px 12px;border-radius:var(--r);transition:all .15s;text-transform:uppercase}
+.mod-btn:hover{border-color:rgba(255,255,255,.35);color:#fff}
+.mod-btn.on{background:rgba(201,0,69,.25);border-color:var(--acc);color:#fff}
+.sub-lbl{font-size:10px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;font-family:Ubuntu,sans-serif}
+
+/* Map list: anchor_left=0.5, offset_right=-8 */
+#map-list-wrap{position:absolute;left:50%;right:8px;top:128px;bottom:80px;z-index:1;display:flex;flex-direction:column}
+#map-list{flex:1;overflow-y:auto;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.15) transparent}
+#map-list-inner{display:flex;flex-direction:column}
+.map-entry{background:rgba(0,0,0,.471);border-radius:2px 8px 8px 2px;border-left:2px solid transparent;
+           padding:10px 14px;margin-bottom:2px;cursor:pointer;transition:all .1s;
+           display:flex;align-items:center;gap:10px}
+.map-entry:hover{background:rgba(26,26,26,.5);border-left-color:var(--acc)}
+.map-entry.selected{background:rgba(26,26,26,.314);border-left-color:var(--acc)}
+.me-cov{width:42px;height:42px;background:rgba(255,255,255,.06);border-radius:3px;flex-shrink:0;overflow:hidden}
+.me-cov img{width:100%;height:100%;object-fit:cover}
+.me-inf{flex:1;min-width:0}
+.me-t{font-family:Comfortaa,sans-serif;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.me-a{font-size:12px;color:var(--muted)}
+.me-d{font-size:11px;margin-top:1px}
+.me-del{flex-shrink:0;background:none;border:none;color:var(--muted);font-size:14px;cursor:pointer;padding:2px 6px;border-radius:4px;opacity:0;transition:opacity .15s,color .15s}
+.map-entry:hover .me-del{opacity:1}
+.me-del:hover{color:#ff4466!important;opacity:1!important}
+.import-hint{padding:20px;color:var(--dim);font-size:13px;text-align:center}
+.import-hint strong{color:rgba(255,255,255,.5)}
+
+/* Play screen footer — 72px matching jukebox */
+#play-footer{
+  position:absolute;left:8px;right:8px;bottom:4px;height:72px;z-index:2;
+  background:rgba(6,5,9,.82);backdrop-filter:blur(12px);border-radius:var(--r);
+  display:flex;align-items:center;padding:0 12px;gap:8px
+}
+.btn-flat{background:none;border:none;color:#fff;cursor:pointer;font-family:Ubuntu,sans-serif;
+          font-size:22px;padding:8px 16px;border-radius:var(--r);transition:background .1s;letter-spacing:.3px}
+.btn-flat:hover{background:rgba(255,255,255,.07)}
+#play-footer-title{font-family:Ubuntu,sans-serif;font-size:13px;color:var(--dim);margin-left:8px}
+#btn-play-go{margin-left:auto;background:var(--acc);border:none;color:#fff;
+             font-family:Roboto,sans-serif;font-size:20px;font-weight:700;letter-spacing:3px;
+             padding:10px 32px;border-radius:var(--r);cursor:pointer;transition:filter .12s}
+#btn-play-go:hover{filter:brightness(1.12)}
+
+/* ═══════════════════════════════════════════════════════════
+   PAUSE MENU  (game.tscn Menu/Holder: 440×560 centered)
+   ═══════════════════════════════════════════════════════════ */
+#scr-pause{
+  display:none;position:fixed;inset:0;z-index:20;
+  align-items:center;justify-content:center;
+  background:rgba(0,0,0,.25);backdrop-filter:blur(8px)
+}
+#scr-pause.vis{display:flex}
+/* Holder: 440×560 centered, StyleBoxFlat with bg */
+#pause-box{width:440px;background:rgba(6,5,9,.92);border-radius:6px;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 8px 48px rgba(0,0,0,.7)}
+.p-hdr{padding:18px 32px;font-family:Roboto,sans-serif;font-size:36px;font-weight:700;text-align:center;letter-spacing:1px}
+.p-note{font-family:Ubuntu,sans-serif;font-style:italic;font-size:12px;color:rgba(255,255,255,.3);text-align:center;padding:0 32px 14px;letter-spacing:.5px}
+.p-sep{height:1px;background:rgba(255,255,255,.06);margin:0 32px}
+/* Buttons: anchor ranges 0.2-0.35, 0.35-0.5, 0.5-0.65, 0.65-0.8 → font_size=28 */
+.p-btn{background:transparent;border:none;color:#fff;cursor:pointer;font-family:Ubuntu,sans-serif;
+       font-size:28px;padding:18px 32px;text-align:left;width:100%;letter-spacing:.5px;transition:background .08s}
+.p-btn:hover{background:rgba(255,255,255,.05)}
+.p-btn:active{background:rgba(255,255,255,.09)}
+
+/* ═══════════════════════════════════════════════════════════
+   RESULTS SCREEN
+   results.tscn: bg Color(0.0253,0.0179,0.0358) ≈ same as menu
+   ═══════════════════════════════════════════════════════════ */
+#scr-results{display:none;position:fixed;inset:0;z-index:20;background:var(--bg)}
+#scr-results.vis{display:block}
+/* CoverBackground: fills 100%, modulate=0.149, expand=COVER (cover) */
+#r-cover-bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.149;pointer-events:none}
+/* Alpha gradient (alpha_gradient.gdshader) fades left edge */
+#r-cover-grad{position:absolute;inset:0;
+              background:linear-gradient(to right, rgba(6,5,9,.96) 25%, rgba(6,5,9,.55) 65%, rgba(6,5,9,.72) 100%);
+              pointer-events:none}
+
+/* TopBar: anchors_preset=10, 8px from edges, 64px tall (offset_bottom=64), blur */
+#r-topbar{position:absolute;left:8px;right:8px;top:8px;height:56px;
+          background:rgba(6,5,9,.82);backdrop-filter:blur(12px);
+          border-radius:var(--r);display:flex;align-items:center;padding:0 12px;gap:10px;z-index:2}
+.r-logo{width:40px;height:40px;background:url(skin_RhythiaSquircle.png) no-repeat center/contain}
+/* "RESULTS" label: anchor_left=0.6, right-aligned, Roboto-Medium 32px */
+#r-topbar-title{margin-left:auto;font-family:Roboto,sans-serif;font-size:28px;font-weight:700;letter-spacing:2px}
+
+/* Holder: panel fills screen, StyleBoxEmpty */
+#r-holder{position:absolute;inset:0;transition:transform .1s ease-out}
+
+/* Title: offset_top=96, offset_left=32, font Ubuntu-Medium 64px with black outline */
+#r-title{position:absolute;top:96px;left:32px;right:32px;
+         font-family:Ubuntu,sans-serif;font-size:52px;font-weight:500;
+         white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+         text-shadow:0 0 0 rgba(0,0,0,.376),0 2px 8px rgba(0,0,0,.6)}
+/* Difficulty: offset_top=168, Ubuntu-Regular 36px, Color(0.627,0.627,0.627) */
+#r-diff{position:absolute;top:168px;left:32px;right:7px;
+        font-family:Ubuntu,sans-serif;font-size:28px;color:var(--muted);
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Mappers: offset_top=212, Ubuntu-Regular 24px, gray */
+#r-mapper{position:absolute;top:212px;left:32px;right:7px;
+          font-family:Ubuntu,sans-serif;font-size:19px;color:var(--muted)}
+/* Speed: offset_top=248, anchor_right=0.2, Ubuntu-Medium 42px */
+#r-speed{position:absolute;top:248px;left:32px;
+         font-family:Ubuntu,sans-serif;font-size:34px;font-weight:500}
+/* Mods: offset_top=248, anchor_left=0.25 */
+#r-mods-row{position:absolute;top:256px;left:25%;
+            font-family:Ubuntu,sans-serif;font-size:14px;color:var(--dim);display:flex;align-items:center;gap:6px}
+/* Separator: offset_top=300, height=2 */
+.r-sep{position:absolute;top:300px;left:32px;right:32px;height:2px;background:rgba(255,255,255,.15)}
+/* Accuracy: offset_top=308, anchor_right=0.3, Ubuntu-Medium 64px */
+#r-acc{position:absolute;top:308px;left:32px;
+       font-family:Ubuntu,sans-serif;font-size:52px;font-weight:500}
+/* Hits: offset_top=308, anchor_left=0.3, right, gray 64px */
+#r-hits{position:absolute;top:308px;right:32px;
+        font-family:Ubuntu,sans-serif;font-size:52px;font-weight:500;
+        color:var(--muted);text-align:right}
+/* Score: offset_top=388, anchor_right=0.3, Ubuntu-Medium 42px */
+#r-score{position:absolute;top:388px;left:32px;
+         font-family:Ubuntu,sans-serif;font-size:34px;font-weight:500}
+/* Status: offset_top=388, anchor_left=0.3, right, 42px */
+#r-status{position:absolute;top:388px;right:32px;
+          font-family:Ubuntu,sans-serif;font-size:34px;font-weight:500;text-align:right}
+.r-status.rs-p{color:#86efac}.r-status.rs-f{color:#f87171}.r-status.rs-d{color:#fb923c}
+
+/* Graph: anchor_top=1 offset_top=-256 offset_bottom=-96 → bottom-256 to bottom-96 = 160px
+   Width: offset_left=32, anchor_right=0.6 */
+#r-graph-wrap{position:absolute;bottom:96px;left:32px;width:60%;height:160px}
+#r-graph-lbl{font-size:9px;letter-spacing:2px;color:rgba(160,160,160,.6);
+             text-transform:uppercase;margin-bottom:3px;font-family:Ubuntu,sans-serif}
+#r-graph{width:100%;height:128px;display:block}
+/* OffsetTop "0ms" and OffsetBottom "55ms" — LabelSettings_6anxq: Ubuntu-Regular 11px, gray */
+.r-gax{position:relative;height:0}
+.r-gax-top{position:absolute;top:-136px;left:-32px;font-size:11px;color:var(--muted);
+           font-family:Ubuntu,sans-serif;text-align:right;width:28px}
+.r-gax-bot{position:absolute;top:4px;left:-32px;font-size:11px;color:var(--muted);
+           font-family:Ubuntu,sans-serif;text-align:right;width:28px}
+
+/* Footer: offset_top=-64 (60px), 4px from edges, blur */
+#r-footer{position:absolute;bottom:4px;left:4px;right:4px;height:60px;
+          background:rgba(6,5,9,.82);backdrop-filter:blur(12px);
+          border-radius:var(--r);display:flex;align-items:center;padding:0 8px;gap:8px;z-index:2}
+/* Back and Play buttons: flat, font_size=22 */
+.r-btn{background:none;border:none;color:#fff;cursor:pointer;
+       font-family:Ubuntu,sans-serif;font-size:22px;padding:8px 16px;
+       border-radius:var(--r);transition:background .1s}
+.r-btn:hover{background:rgba(255,255,255,.07)}
+
+/* ═══════════════════════════════════════════════════════════
+   COUNTDOWN  (Roboto 190px, glow rgba(201,0,69,.5))
+   ═══════════════════════════════════════════════════════════ */
+#countdown{position:fixed;inset:0;z-index:25;pointer-events:none;display:none;
+           align-items:center;justify-content:center;
+           font-family:Roboto,sans-serif;font-size:190px;font-weight:700;color:#fff;
+           text-shadow:0 0 80px rgba(201,0,69,.5);background:rgba(0,0,0,.3);transition:opacity .15s}
+#countdown.vis{display:flex}
+
+/* ═══════════════════════════════════════════════════════════
+   SETTINGS MODAL
+   ═══════════════════════════════════════════════════════════ */
+#settings-modal{position:fixed;inset:0;z-index:20;display:none;align-items:center;
+                justify-content:center;background:rgba(0,0,0,.6);backdrop-filter:blur(8px)}
+#settings-modal.vis{display:flex}
+#s-box{width:660px;max-height:82vh;background:rgba(8,6,14,.97);border:1px solid rgba(255,255,255,.07);border-radius:6px;overflow:hidden;display:flex;flex-direction:column}
+#s-head{display:flex;align-items:center;padding:14px 20px;border-bottom:1px solid rgba(255,255,255,.06)}
+#s-head span{font-family:Roboto,sans-serif;font-size:20px;font-weight:700;letter-spacing:2px}
+#settings-close{margin-left:auto;background:none;border:none;color:var(--dim);font-size:24px;cursor:pointer;line-height:1;transition:color .1s}
+#settings-close:hover{color:#fff}
+.s-tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.06)}
+.stab{background:none;border:none;color:var(--dim);cursor:pointer;font-family:Ubuntu,sans-serif;font-size:13px;letter-spacing:1px;padding:10px 18px;text-transform:uppercase;transition:all .1s;border-bottom:2px solid transparent;margin-bottom:-1px}
+.stab:hover{color:#fff}.stab.active{color:#fff;border-bottom-color:var(--acc)}
+#s-body{flex:1;overflow-y:auto;padding:16px 20px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.1) transparent}
+.s-sect{display:none}.s-sect.vis{display:block}
+.srow{display:flex;align-items:center;gap:10px;margin-bottom:8px;min-height:28px}
+.srow-l{font-family:Ubuntu,sans-serif;font-size:13px;color:var(--muted);min-width:180px;flex-shrink:0}
+.srow-l small{display:block;font-size:10px;color:var(--dim);margin-top:2px}
+.srow input[type=range]{flex:1;height:2px;-webkit-appearance:none;background:rgba(255,255,255,.12);outline:none;cursor:pointer}
+.srow input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--acc);border-radius:50%}
+.sval{font-size:12px;color:var(--acc);min-width:44px;text-align:right;font-family:Ubuntu,sans-serif}
+.tog{background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.15);color:var(--dim);cursor:pointer;font-family:Ubuntu,sans-serif;font-size:12px;letter-spacing:1px;padding:4px 14px;border-radius:var(--r);transition:all .15s;min-width:52px;text-align:center}
+.tog:hover{border-color:rgba(255,255,255,.3);color:#fff}
+.tog.on{background:rgba(201,0,69,.2);border-color:var(--acc);color:#fff}
+#s-reset{margin-top:16px;background:rgba(201,0,69,.12);border:1px solid rgba(201,0,69,.3);color:var(--acc);cursor:pointer;font-family:Ubuntu,sans-serif;font-size:13px;padding:8px 20px;border-radius:var(--r);transition:all .1s;width:100%}
+#s-reset:hover{background:rgba(201,0,69,.25)}
+.hotkey-hint{margin-top:12px;color:var(--dim);font-size:12px;line-height:1.9;padding:12px;background:rgba(255,255,255,.03);border-radius:var(--r)}
+.hotkey-hint kbd{display:inline-block;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:3px;padding:1px 5px;font-family:monospace;font-size:11px}
+
+/* ═══════════════════════════════════════════════════════════
+   LOADING + TOAST
+   ═══════════════════════════════════════════════════════════ */
+#scr-loading{position:fixed;inset:0;z-index:30;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px}
+.spin{width:34px;height:34px;border:2px solid rgba(255,255,255,.07);border-top-color:var(--acc);border-radius:50%;animation:spin .72s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.load-txt{font-size:10px;letter-spacing:3px;color:var(--dim);text-transform:uppercase}
+#toast{position:fixed;bottom:88px;left:50%;transform:translateX(-50%) translateY(20px);
+       background:rgba(30,20,40,.95);border:1px solid rgba(255,255,255,.12);
+       border-radius:var(--r);padding:10px 20px;font-size:14px;color:#fff;
+       pointer-events:none;z-index:50;opacity:0;transition:opacity .2s,transform .2s}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#phxm-input{display:none}
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+<canvas id="bg-canvas"></canvas>
+<div id="fps-el"></div>
+
+<!-- ── LOADING ────────────────────── -->
+<div id="scr-loading">
+  <div class="spin"></div>
+  <div class="load-txt">Initialising…</div>
+</div>
+
+<!-- ── HUD ───────────────────────── -->
+<div id="hud">
+  <div id="panel-left">
+    <div id="hud-score">0</div>
+    <div id="ring-wrap">
+      <canvas id="ring-cv" width="108" height="108"></canvas>
+      <div id="hud-mult">1x</div>
+    </div>
+  </div>
+  <div id="panel-right">
+    <div id="hud-acc">100.00%</div>
+    <div id="hm-row">
+      <div class="hm-ico" id="ico-hits"></div>
+      <div id="hud-hits">0</div>
+      <div id="hm-sep">/</div>
+      <div class="hm-ico" id="ico-miss"></div>
+      <div id="hud-miss">0</div>
+    </div>
+    <div class="pdiv"></div>
+    <div id="hud-sum">0</div>
+  </div>
+  <div id="health-wrap"><div id="health-bg"></div><div id="health-fill"></div></div>
+  <div id="prog-wrap"><div id="prog-bg"></div><div id="prog-fill"></div></div>
+  <div id="song-title">Rhythia</div>
+  <div id="song-time">0:00 / 0:00</div>
+  <div id="skip-lbl">Press Space to skip</div>
+  <div id="combo-wrap"><div id="hud-combo">0</div></div>
+  <div id="simple-miss-wrap"><div id="simple-miss">0</div></div>
+</div>
+<div id="popups"></div>
+<div id="dead-ov"></div>
+
+<!-- ── MAIN MENU ─────────────────── -->
+<div id="scr-menu" class="screen">
+  <div class="topbar">
+    <div class="tb-logo"></div>
+    <div class="tb-version">Rhythia<small>early-26feb22</small></div>
+    <div class="tb-nav">
+      <button class="tb-nav-btn active" id="tb-home">Home</button>
+      <button class="tb-nav-btn" id="tb-play">Play</button>
+      <button class="tb-nav-btn" id="tb-extras">Extras</button>
+    </div>
+    <div class="tb-links">
+      <button class="tb-icon" id="btn-settings-menu" title="Settings"><img src="ui_btn_settings.png" alt="settings"></button>
+    </div>
+  </div>
+  <div id="menu-nav">
+    <button class="menu-nav-btn" id="btn-nav-play">PLAY</button>
+    <button class="menu-nav-btn" id="btn-nav-settings">SETTINGS</button>
+    <button class="menu-nav-btn">EXTRAS</button>
+    <button class="menu-nav-btn">QUIT</button>
+  </div>
+  <div id="menu-news">
+    <div class="news-head">0.1.1 (early-26feb22)</div>
+    <div class="news-body">
+      <h3>FEATURES</h3>
+      <p>+ Support for image files other than PNG &amp; JPG</p>
+      <p>+ Reset to defaults setting</p>
+      <p>+ Display FPS setting</p>
+      <p>+ Parallax setting now applies to Spin mode</p>
+      <p>+ Non-PHXM maps imported on startup (SSPM &amp; TXT)</p>
+      <h3>FIXES</h3>
+      <p>* Gameplay performance improvements (~25–35% increase)</p>
+      <p>* Improved map importing (faster and more reliable)</p>
+      <p>* Absolute input made more accurate</p>
+      <p>* Map preview no longer inverted</p>
+      <h3>WEB PORT</h3>
+      <p>+ .phxm &amp; .sspm import (drag &amp; drop or Import button)</p>
+      <p>+ Full settings panel with persistence</p>
+      <p>+ NoFail + Ghost modifiers</p>
+      <p>+ All original gameplay options</p>
+    </div>
+  </div>
+  <div id="jukebox">
+    <button class="juke-btn" id="juke-rewind" title="Rewind">⏮</button>
+    <button class="juke-btn" id="juke-play" title="Play/Pause">▶</button>
+    <button class="juke-btn" id="juke-skip" title="Skip">⏭</button>
+    <div id="jukebox-title">No map selected</div>
+  </div>
+</div>
+
+<!-- ── PLAY SCREEN ───────────────── -->
+<div id="scr-play" class="screen">
+  <div id="play-tile"></div>
+  <div class="topbar">
+    <div class="tb-logo"></div>
+    <div class="tb-version">Rhythia<small>early-26feb22</small></div>
+    <div class="tb-nav">
+      <button class="tb-nav-btn" id="tb-play-home">Home</button>
+      <button class="tb-nav-btn active">Play</button>
+      <button class="tb-nav-btn">Extras</button>
+    </div>
+    <div class="tb-links">
+      <button class="tb-icon" id="btn-settings-play" title="Settings"><img src="ui_btn_settings.png" alt="settings"></button>
+    </div>
+  </div>
+  <div id="sub-top">
+    <div style="flex:1"></div>
+    <button class="sub-btn" id="btn-import"><img src="ui_btn_settings.png" alt="">Import</button>
+    <button class="sub-btn" id="btn-random"><img src="ui_btn_random.png" alt="">Random</button>
+    <div class="sub-sep"></div>
+    <div class="search-wrap"><img src="ui_btn_search.png" alt=""><input type="text" id="search-box" placeholder="Search"></div>
+    <div class="search-wrap"><img src="ui_btn_search.png" alt="" style="opacity:.3"><input type="text" id="search-author-box" placeholder="Author"></div>
+  </div>
+  <div id="map-info">
+    <div class="mi-cover" id="mi-cover-el"><span>NO COVER</span></div>
+    <div id="mi-title">—</div>
+    <div id="mi-diff">—</div>
+    <div id="mi-mapper">—</div>
+    <div class="mi-div"></div>
+    <div class="mi-row"><span>Notes</span><span id="mi-notes">—</span></div>
+    <div class="mi-row"><span>Length</span><span id="mi-len">—</span></div>
+    <div class="mi-div"></div>
+    <div class="sg">
+      <div class="sr"><span class="sl">AR</span><input type="range" id="sl-ar" min="0.5" max="100" step="0.5" value="32"><span class="sn" id="sl-ar-d">32</span></div>
+      <div class="sr"><span class="sl">AD</span><input type="range" id="sl-ad" min="0.5" max="100" step="0.5" value="20"><span class="sn" id="sl-ad-d">20.0</span></div>
+      <div class="sr"><span class="sl">Speed</span><input type="range" id="sl-speed" min="0.25" max="2.0" step="0.05" value="1.0"><span class="sn" id="sl-speed-d">1.00</span></div>
+      <div class="sr"><span class="sl">Sensitivity</span><input type="range" id="sl-sens" min="0.01" max="2.5" step="0.01" value="0.5"><span class="sn" id="sl-sens-d">0.50</span></div>
+    </div>
+    <div class="mi-div"></div>
+    <div class="sub-lbl">MODIFIERS</div>
+    <div class="mod-row">
+      <button class="mod-btn" id="mod-nofail" title="Cannot die. No score bonus.">No Fail</button>
+      <button class="mod-btn" id="mod-ghost" title="Notes fade before hitting. +6.75% score.">Ghost</button>
+    </div>
+  </div>
+  <div id="map-list-wrap">
+    <div id="map-list"><div id="map-list-inner"></div></div>
+  </div>
+  <div id="play-footer">
+    <button class="btn-flat" id="btn-back-menu">Back</button>
+    <div id="play-footer-title">—</div>
+    <button id="btn-play-go">PLAY</button>
+  </div>
+</div>
+
+<!-- ── PAUSE ─────────────────────── -->
+<div id="scr-pause">
+  <div id="pause-box">
+    <div class="p-hdr">PAUSED</div>
+    <div class="p-note">NOTE: Pausing disqualifies your pass</div>
+    <div class="p-sep"></div>
+    <button class="p-btn" id="btn-resume">RESUME</button>
+    <button class="p-btn" id="btn-restart">RESTART</button>
+    <button class="p-btn" id="btn-settings-pause">SETTINGS</button>
+    <button class="p-btn" id="btn-giveup">GIVE UP</button>
+  </div>
+</div>
+
+<!-- ── RESULTS ────────────────────── -->
+<div id="scr-results">
+  <div id="r-cover-bg"></div>
+  <div id="r-cover-grad"></div>
+  <div id="r-topbar">
+    <div class="r-logo"></div>
+    <div id="r-topbar-title">RESULTS</div>
+  </div>
+  <div id="r-holder">
+    <div id="r-title">—</div>
+    <div id="r-diff">—</div>
+    <div id="r-mapper">—</div>
+    <div id="r-speed">1.00x</div>
+    <div id="r-mods-row">Mods: <span id="r-mods">—</span></div>
+    <div class="r-sep"></div>
+    <div id="r-acc">100.00%</div>
+    <div id="r-hits">0 / 0</div>
+    <div id="r-score">0</div>
+    <div id="r-status" class="r-status rs-p">PASSED</div>
+    <div id="r-graph-wrap">
+      <div id="r-graph-lbl">Hit timing</div>
+      <canvas id="r-graph" width="600" height="128"></canvas>
+      <div class="r-gax">
+        <div class="r-gax-top">0ms</div>
+        <div class="r-gax-bot">55ms</div>
+      </div>
+    </div>
+  </div>
+  <div id="r-footer">
+    <button class="r-btn" id="btn-tomenu">Back</button>
+    <button class="r-btn" id="btn-retry" style="margin-left:auto">Play</button>
+  </div>
+</div>
+
+<!-- ── COUNTDOWN ─────────────────── -->
+<div id="countdown"></div>
+
+<!-- ── SETTINGS MODAL ────────────── -->
+<div id="settings-modal">
+  <div id="s-box">
+    <div id="s-head">
+      <span>SETTINGS</span>
+      <button id="settings-close">×</button>
+    </div>
+    <div class="s-tabs">
+      <button class="stab active" data-sec="s-gameplay">Gameplay</button>
+      <button class="stab" data-sec="s-visual">Visual</button>
+      <button class="stab" data-sec="s-audio">Audio</button>
+      <button class="stab" data-sec="s-other">Other</button>
+    </div>
+    <div id="s-body">
+      <div id="s-gameplay" class="s-sect vis">
+        <div class="srow"><span class="srow-l">Sensitivity<small>Cursor speed</small></span><input type="range" id="s-sens" min="0.01" max="2.5" step="0.01" value="0.5"><span class="sval" id="s-sens-d">0.50</span></div>
+        <div class="srow"><span class="srow-l">Approach Rate</span><input type="range" id="s-ar" min="0.5" max="100" step="0.5" value="32"><span class="sval" id="s-ar-d">32</span></div>
+        <div class="srow"><span class="srow-l">Approach Distance</span><input type="range" id="s-ad" min="0.5" max="100" step="0.5" value="20"><span class="sval" id="s-ad-d">20.0</span></div>
+        <div class="srow"><span class="srow-l">Fade In %<small>Distance to full opacity</small></span><input type="range" id="s-fadein" min="0" max="100" step="1" value="15"><span class="sval" id="s-fadein-d">15</span></div>
+        <div class="srow"><span class="srow-l">Camera Parallax</span><input type="range" id="s-parallax" min="0" max="1" step="0.05" value="0.1"><span class="sval" id="s-parallax-d">0.10</span></div>
+        <div class="srow"><span class="srow-l">Field of View</span><input type="range" id="s-fov" min="60" max="120" step="1" value="70"><span class="sval" id="s-fov-d">70</span></div>
+        <div class="srow"><span class="srow-l">Absolute Input<small>Center-relative mouse</small></span><button class="tog" id="s-absInput">OFF</button></div>
+        <div class="srow"><span class="srow-l">Cursor Drift<small>Clamp each delta</small></span><button class="tog on" id="s-drift">ON</button></div>
+        <div class="srow"><span class="srow-l">Fade Out<small>Notes fade at hit line</small></span><button class="tog on" id="s-fadeout">ON</button></div>
+        <div class="srow"><span class="srow-l">Pushback<small>Notes pass through zero</small></span><button class="tog on" id="s-pushback">ON</button></div>
+      </div>
+      <div id="s-visual" class="s-sect">
+        <div class="srow"><span class="srow-l">Note Opacity</span><input type="range" id="s-nopacity" min="0" max="1" step="0.05" value="1"><span class="sval" id="s-nopacity-d">1.00</span></div>
+        <div class="srow"><span class="srow-l">Note Size</span><input type="range" id="s-nsize" min="0" max="2" step="0.025" value="0.875"><span class="sval" id="s-nsize-d">0.875</span></div>
+        <div class="srow"><span class="srow-l">Cursor Scale</span><input type="range" id="s-cscale" min="0" max="4" step="0.025" value="1"><span class="sval" id="s-cscale-d">1.00</span></div>
+        <div class="srow"><span class="srow-l">Cursor Rotation<small>Degrees per second</small></span><input type="range" id="s-crot" min="-360" max="360" step="1" value="0"><span class="sval" id="s-crot-d">0</span></div>
+        <div class="srow"><span class="srow-l">Trail Time</span><input type="range" id="s-ttime" min="0" max="0.5" step="0.01" value="0.05"><span class="sval" id="s-ttime-d">0.05</span></div>
+        <div class="srow"><span class="srow-l">Cursor Trail</span><button class="tog" id="s-ctrail">OFF</button></div>
+        <div class="srow"><span class="srow-l">Simple HUD<small>Only show misses + combo</small></span><button class="tog" id="s-simplehud">OFF</button></div>
+        <div class="srow"><span class="srow-l">Hit Score Popups</span><button class="tog on" id="s-hitpop">ON</button></div>
+        <div class="srow"><span class="srow-l">Miss Popups</span><button class="tog on" id="s-misspop">ON</button></div>
+      </div>
+      <div id="s-audio" class="s-sect">
+        <div class="srow"><span class="srow-l">Master Volume</span><input type="range" id="s-volm" min="0" max="100" step="1" value="50"><span class="sval" id="s-volm-d">50</span></div>
+        <div class="srow"><span class="srow-l">Music Volume</span><input type="range" id="s-volmu" min="0" max="100" step="1" value="50"><span class="sval" id="s-volmu-d">50</span></div>
+        <div class="srow"><span class="srow-l">SFX Volume</span><input type="range" id="s-volsfx" min="0" max="100" step="1" value="50"><span class="sval" id="s-volsfx-d">50</span></div>
+        <div class="srow"><span class="srow-l">Always Play Hit Sound<small>Sound fires at note time</small></span><button class="tog" id="s-alwayssnd">OFF</button></div>
+      </div>
+      <div id="s-other" class="s-sect">
+        <div class="srow"><span class="srow-l">Display FPS</span><button class="tog on" id="s-fps">ON</button></div>
+        <div class="hotkey-hint">
+          <strong>Gameplay hotkeys:</strong><br>
+          <kbd>Esc</kbd> pause &nbsp; <kbd>Space</kbd> skip break &nbsp; <kbd>`</kbd> restart<br>
+          <kbd>F</kbd> toggle fade out &nbsp; <kbd>P</kbd> toggle pushback
+        </div>
+        <button id="s-reset">⚠ Reset All Settings to Defaults</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<input type="file" id="phxm-input" accept=".phxm,.sspm" multiple>
+
+<script src="map_data.js"></script>
+<script>
+// ── Noise-wave background ─────────────────────────────────
+(function(){
+  const cv=document.getElementById('bg-canvas'),ctx=cv.getContext('2d');let t=0;
+  function rsz(){cv.width=innerWidth;cv.height=innerHeight}
+  window.addEventListener('resize',rsz);rsz();
+  function noise(x,y,z){return(Math.sin(x*1.7+z*2.3)*Math.cos(y*1.3-z*1.8)+Math.sin(x*3.1-z*1.1)*Math.sin(y*2.7+z*0.9)+Math.cos(x*0.9+y*2.1+z*3.7))/3}
+  const R=4;
+  function draw(){
+    const W=cv.width,H=cv.height,im=ctx.createImageData(W,H),d=im.data,zt=t/25;
+    for(let py=0;py<H;py+=R)for(let px=0;px<W;px+=R){
+      const x=px/800,y=py/800-zt,a=Math.max(0,Math.min(1,(noise(x,y,zt)+1)/2));
+      const mix=(Math.floor(a*96)%20===0?1:0)+(1-Math.pow(a,50))/20;
+      const s=Math.sin(t/10)/2+0.5;
+      let r=Math.round(5+(255-5)*mix),g=Math.round(4+(96-4)*mix),b=Math.round(8+(Math.round(a/1.75*255)-8)*mix);
+      const fr=Math.round(r+(b-r)*s),fg=g,fb=Math.round(b+(r-b)*s);
+      for(let dy=0;dy<R&&py+dy<H;dy++)for(let dx=0;dx<R&&px+dx<W;dx++){
+        const i=((py+dy)*W+(px+dx))*4;d[i]=fr;d[i+1]=fg;d[i+2]=fb;d[i+3]=255;
+      }
+    }
+    ctx.putImageData(im,0,0);t+=0.016;requestAnimationFrame(draw);
+  }
+  draw();
+})();
+</script>
+<script type="module" src="game.js"></script>
+<script>
+// ── Menu navigation ───────────────────────────────────────
+const G=id=>document.getElementById(id);
+function showScreen(id){
+  ['scr-menu','scr-play'].forEach(s=>{
+    const e=G(s);if(e)e.style.display=s===id?'block':'none';
+  });
+}
+G('btn-nav-play')?.addEventListener('click',()=>showScreen('scr-play'));
+G('tb-play')?.addEventListener('click',()=>showScreen('scr-play'));
+G('tb-play-home')?.addEventListener('click',()=>showScreen('scr-menu'));
+G('btn-back-menu')?.addEventListener('click',()=>showScreen('scr-menu'));
+// Play-screen sliders live display
+[['sl-ar',0],['sl-ad',1],['sl-speed',2],['sl-sens',2]].forEach(([id,dec])=>{
+  const e=G(id);if(!e)return;
+  e.addEventListener('input',()=>{const d=G(id+'-d');if(d)d.textContent=parseFloat(e.value).toFixed(dec);});
+});
+// Play button
+G('btn-play-go')?.addEventListener('click',()=>window.dispatchEvent(new CustomEvent('rhythia-play')));
+</script>
+</body>
+</html>

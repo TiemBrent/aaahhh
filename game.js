@@ -1,0 +1,1611 @@
+// ============================================================
+// RHYTHIA WEB  —  faithful port of github.com/Rhythia/Client
+// All formulas verified against source C# files (AGPL-3.0)
+// ============================================================
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.module.js';
+
+// ─── Constants  (Constants.cs) ──────────────────────────────
+const CURSOR_SIZE  = 0.2625;
+const GRID_SIZE    = 3.0;
+const HIT_BOX_SIZE = 0.07;
+const HIT_WINDOW   = 55;          // ms
+const BOUNDS       = GRID_SIZE / 2 - CURSOR_SIZE / 2;   // 1.36875
+const BREAK_TIME   = 4000;        // ms gap before skip is allowed
+const DIFFICULTIES = ['N/A','Easy','Medium','Hard','Insane','Illogical'];
+const DIFF_COLORS  = ['#ffffff','#77f379','#fff832','#e24479','#9d6eff','#0094fc'];
+// NoteColors default from SkinProfile.cs / colorsets/default.txt
+const NOTE_C = [new THREE.Color(0xff0059), new THREE.Color(0xffd8e6)];
+
+// ─── Settings (SettingsProfile.cs defaults from default.json) ─
+const DEFAULTS = {
+  // Gameplay
+  sensitivity:0.5, absoluteInput:false, cursorDrift:true,
+  approachRate:32, approachDistance:20,
+  fadeIn:15, fadeOut:true, pushback:true,
+  cameraParallax:0.1, hudParallax:0.0, fov:70,
+  // Visual
+  noteOpacity:1.0, noteSize:0.875,
+  cursorScale:1.0, cursorRotation:0,
+  cursorTrail:false, trailTime:0.05, trailDetail:0.05,
+  useCursorInMenus:false, videoDim:0.0, videoRenderScale:1.0,
+  simpleHUD:false,
+  hitPopups:true, missPopups:true,
+  spaceHitEffects:true,
+  // Audio
+  alwaysPlayHitSound:false,
+  volumeMaster:50, volumeMusic:50, volumeSFX:50,
+  autojukeboxStart:false,
+  // Video
+  fullscreen:false, unlockFPS:false, fpsCap:240,
+  // Other
+  displayFPS:true,
+  recordReplays:true,
+};
+let S = loadSettings();
+function loadSettings(){
+  try{ return {...DEFAULTS,...JSON.parse(localStorage.getItem('rhythia_s')||'{}')}; }
+  catch{ return {...DEFAULTS}; }
+}
+function saveSettings(){ try{localStorage.setItem('rhythia_s',JSON.stringify(S));}catch{} }
+
+// ─── Settings Profiles (save/load different configurations) ────
+let profiles = {};
+let currentProfile = 'default';
+function loadProfiles(){
+  try{ profiles=JSON.parse(localStorage.getItem('rhythia_profiles')||'{"default":{}}'); }
+  catch{ profiles={'default':{}}; }
+  const savedProfile=localStorage.getItem('rhythia_currentProfile');
+  if(savedProfile && profiles[savedProfile]) currentProfile=savedProfile;
+}
+function saveProfile(name=currentProfile, data=S){
+  profiles[name]=data; localStorage.setItem('rhythia_profiles',JSON.stringify(profiles));
+  localStorage.setItem('rhythia_currentProfile',name); currentProfile=name;
+}
+function loadProfile(name){
+  if(profiles[name]){ S={...DEFAULTS,...profiles[name]}; currentProfile=name;
+    applySettings(); populateSettings(); syncPlaySliders();
+    toast(`Loaded profile: ${name}`);
+  }
+}
+function deleteProfile(name){
+  if(name!=='default' && profiles[name]){ delete profiles[name];
+    localStorage.setItem('rhythia_profiles',JSON.stringify(profiles));
+    if(currentProfile===name){ currentProfile='default'; loadProfile('default'); }
+  }
+}
+
+// ─── Map persistence (IndexedDB + localStorage fallback) ──────
+let useIndexedDB=true;
+const MAP_STORAGE_KEY='rhythia_maps_cached';  // for localStorage fallback
+async function openDB(){
+  return new Promise((res,rej)=>{
+    try{
+      const r=indexedDB.open('rhythia_maps',1);
+      r.onupgradeneeded=e=>e.target.result.createObjectStore('maps',{keyPath:'id'});
+      r.onsuccess=e=>res(e.target.result);
+      r.onerror=e=>{useIndexedDB=false;rej(e.target.error);};
+    }catch(e){useIndexedDB=false;rej(e);}
+  });
+}
+async function saveMapIDB(id,filename,buf){
+  try{
+    if(!useIndexedDB) throw new Error('IndexedDB disabled');
+    const db=await openDB();
+    await new Promise((res,rej)=>{
+      const tx=db.transaction('maps','readwrite');
+      tx.objectStore('maps').put({id,filename,buf});
+      tx.oncomplete=res; tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){
+    console.warn('IDB save failed, falling back to localStorage', e);
+    // Fallback: save compressed data to localStorage (limited size)
+    try{
+      const compressed=btoa(String.fromCharCode(...new Uint8Array(buf).slice(0,1000000)));
+      let stored=JSON.parse(localStorage.getItem(MAP_STORAGE_KEY)||'{}');
+      stored[id]={filename,data:compressed};
+      localStorage.setItem(MAP_STORAGE_KEY,JSON.stringify(stored));
+      console.log('Map saved to localStorage cache');
+    }catch(e2){console.warn('localStorage fallback also failed',e2);}
+  }
+}
+async function deleteMapIDB(id){
+  try{
+    if(!useIndexedDB) throw new Error('IndexedDB disabled');
+    const db=await openDB();
+    await new Promise((res,rej)=>{
+      const tx=db.transaction('maps','readwrite');
+      tx.objectStore('maps').delete(id);
+      tx.oncomplete=res; tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){
+    // Remove from localStorage fallback
+    try{
+      let stored=JSON.parse(localStorage.getItem(MAP_STORAGE_KEY)||'{}');
+      delete stored[id];
+      localStorage.setItem(MAP_STORAGE_KEY,JSON.stringify(stored));
+    }catch(e2){}
+  }
+}
+async function loadPersistedMaps(){
+  // Try IndexedDB first
+  try{
+    const db=await openDB();
+    const entries=await new Promise((res,rej)=>{
+      const tx=db.transaction('maps','readonly');
+      const req=tx.objectStore('maps').getAll();
+      req.onsuccess=e=>res(e.target.result);
+      req.onerror=e=>rej(e.target.error);
+    });
+    for(const {filename,buf} of entries){
+      try{
+        const file=new File([buf],filename);
+        if(filename.toLowerCase().endsWith('.sspm')) await importSSPM(file,true);
+        else await importPHXM(file,true);
+      }catch(e){console.warn('Failed to restore map:',filename,e);}
+    }
+  }catch(e){
+    console.warn('IndexedDB unavailable, trying localStorage fallback', e);
+    // Fallback to localStorage
+    try{
+      const stored=JSON.parse(localStorage.getItem(MAP_STORAGE_KEY)||'{}');
+      for(const [id,{filename,data}] of Object.entries(stored)){
+        try{
+          const arr=new Uint8Array(atob(data).split('').map(c=>c.charCodeAt(0)));
+          const file=new File([arr],filename);
+          console.log('Restoring', filename, 'from localStorage');
+          // Note: partial data may not decode fully, so errors are expected
+          if(filename.toLowerCase().endsWith('.sspm')) try{await importSSPM(file,true);}catch(e){}
+          else try{await importPHXM(file,true);}catch(e){}
+        }catch(e){console.warn('Failed to restore from localStorage:',filename,e);}
+      }
+    }catch(e){console.warn('localStorage fallback also failed',e);}
+  }
+}
+
+// ─── THREE.js renderer  ─────────────────────────────────────
+const canvas = document.getElementById('c');
+// alpha:true → transparent background in menus so bg-canvas shows through
+const R = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+R.setPixelRatio(Math.min(devicePixelRatio, 2));
+R.setClearColor(0, 0);          // fully transparent
+
+const scene = new THREE.Scene();  // background null = transparent
+const cam = new THREE.PerspectiveCamera(S.fov, 1, 0.01, 500);
+cam.position.set(0, 0, 3.75);
+
+// ─── Textures  ───────────────────────────────────────────────
+const TL = new THREE.TextureLoader();
+const tex = s => { const t=TL.load(s); t.minFilter=t.magFilter=THREE.LinearFilter; return t; };
+const T_GRID   = tex('skin_grid.png');
+const T_CURSOR = tex('skin_cursor.png');
+const T_BLANK  = tex('skin_squircle_blank.png');
+const T_BLOOM  = tex('skin_squircle_bloom.png');
+
+// ─── Scene: grid (visible only during gameplay) ──────────────
+const gridMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(4,4),
+  new THREE.MeshBasicMaterial({map:T_GRID, transparent:true, depthWrite:false})
+);
+gridMesh.visible = false;
+scene.add(gridMesh);
+
+// ─── Scene: cursor  ──────────────────────────────────────────
+const cursorMat = new THREE.MeshBasicMaterial({map:T_CURSOR, transparent:true, depthWrite:false, depthTest:false});
+const cursorMesh = new THREE.Mesh(new THREE.PlaneGeometry(1,1), cursorMat);
+cursorMesh.renderOrder = 999;
+scene.add(cursorMesh);
+// Applied on boot and when settings change:
+function applyCursorScale(){ cursorMesh.scale.setScalar(CURSOR_SIZE * S.cursorScale); }
+
+// ─── Note pool  ──────────────────────────────────────────────
+const notePool = [];
+function newNote(){
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.PlaneGeometry(2,2),
+    new THREE.MeshBasicMaterial({map:T_BLANK, transparent:true, depthWrite:false}));
+  const bloom = new THREE.Mesh(new THREE.PlaneGeometry(2,2),
+    new THREE.MeshBasicMaterial({map:T_BLOOM, transparent:true, depthWrite:false,
+                                  blending:THREE.AdditiveBlending}));
+  bloom.scale.setScalar(1.5);
+  g.add(body); g.add(bloom);
+  g.visible = false;
+  scene.add(g);
+  return {g, body, bloom};
+}
+for(let i=0;i<100;i++) notePool.push(newNote());
+const getNoteObj = () => notePool.find(o=>!o.g.visible) || (notePool.push(newNote()), notePool[notePool.length-1]);
+
+// Note scale: noteSize/4 (LegacyRenderer.cs line: float noteSize = settings.NoteSize.Value / 4)
+function getNoteScale(){ return S.noteSize / 4; }
+
+// ─── Trail pool  ─────────────────────────────────────────────
+const trailPool = [];
+function newTrail(){
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1,1),
+    new THREE.MeshBasicMaterial({map:T_BLANK, transparent:true, depthWrite:false, depthTest:false}));
+  m.renderOrder = 990; m.visible = false; scene.add(m); return m;
+}
+for(let i=0;i<64;i++) trailPool.push(newTrail());
+const trailHist = [];  // [{t, x, y, rz}]
+
+function updateTrail(cx, cy){
+  const now = performance.now()/1000;
+  // C#: cull entries where now - entry.Time >= trailTime (not strict >)
+  while(trailHist.length && now - trailHist[0].t >= S.trailTime) trailHist.shift();
+  const last = trailHist[trailHist.length-1];
+  // C#: only add if cursor position changed (DistanceTo != 0), but small epsilon prevents spam
+  if(!last || Math.hypot(last.x-cx, last.y-cy) > 0)
+    trailHist.push({t:now, x:cx, y:cy, rz:cursorMesh.rotation.z});
+
+  if(!S.cursorTrail){ trailPool.forEach(t=>t.visible=false); return; }
+
+  const n = Math.min(trailHist.length, trailPool.length);
+  const sc = CURSOR_SIZE * S.cursorScale;  // C#: float size = cursor.Mesh.Size.X = CURSOR_SIZE*cursorScale
+  for(let i=0;i<trailPool.length;i++){
+    if(i>=n){ trailPool[i].visible=false; continue; }
+    const e = trailHist[trailHist.length-1-i];
+    const age = (now-e.t)/S.trailTime;
+    trailPool[i].scale.setScalar(sc);
+    trailPool[i].position.set(e.x, e.y, 0.0005);
+    trailPool[i].rotation.z = e.rz;
+    // C#: alpha = difference/trailTime*255; color = ffffff{255-alpha} → opacity = 1 - age
+    trailPool[i].material.opacity = Math.max(0, 1 - age);
+    trailPool[i].visible = true;
+  }
+}
+
+// ─── PHXM  file parser  ──────────────────────────────────────
+// All .phxm files use ZIP STORE (compress=0), no deflate needed.
+async function unzipSTORE(file){
+  const buf = file instanceof ArrayBuffer ? file : await file.arrayBuffer();
+  const v = new DataView(buf), u = new Uint8Array(buf), files = {};
+  let i = 0;
+  while(i < u.length-4){
+    if(v.getUint32(i,true) !== 0x04034b50){ i++; continue; }
+    const flags=v.getUint16(i+6,true), meth=v.getUint16(i+8,true);
+    let cz=v.getUint32(i+18,true), uz=v.getUint32(i+22,true);
+    const fnl=v.getUint16(i+26,true), exl=v.getUint16(i+28,true);
+    const name=new TextDecoder().decode(u.slice(i+30,i+30+fnl));
+    const start=i+30+fnl+exl;
+    if((flags&8)&&cz===0&&uz===0){
+      let end=start;
+      while(end<u.length-4){const s=v.getUint32(end,true);if(s===0x04034b50||s===0x02014b50||s===0x06054b50)break;end++;}
+      cz=uz=end-start;
+    }
+    if(meth===0){
+      const data=buf.slice(start,start+uz);
+      files[name]={async(t){ return t==='string'?new TextDecoder().decode(new Uint8Array(data)):t==='arraybuffer'?data:new Uint8Array(data); }};
+    }
+    i=start+cz;
+  }
+  return {file:n=>files[n]??null};
+}
+
+// Binary note decoder (MapParser.cs DecodePHXMO)
+function parsePHXMO(buf){
+  const v=new DataView(buf); let o=4;
+  const n=v.getUint32(o,true); o+=4;
+  const notes=[];
+  for(let i=0;i<n;i++){
+    const ms=v.getUint32(o,true); o+=4;
+    const q=v.getUint8(o)!==0; o+=1;
+    let x,y;
+    if(q){x=v.getFloat32(o,true);o+=4;y=v.getFloat32(o,true);o+=4;}
+    else {x=v.getUint8(o)-1;o+=1;y=v.getUint8(o)-1;o+=1;}
+    notes.push([ms,x,y]);
+  }
+  return notes;
+}
+
+// ─── SSPM binary parsers  (MapParser.cs sspmV1 / sspmV2) ────
+function readSSPM(buf){
+  const v=new DataView(buf), u=new Uint8Array(buf); let o=0;
+  const str=(n)=>{ const s=new TextDecoder().decode(u.slice(o,o+n)); o+=n; return s; };
+  const u8=()=>{ return v.getUint8(o++); };
+  const u16=()=>{ const n=v.getUint16(o,true); o+=2; return n; };
+  const u32=()=>{ const n=v.getUint32(o,true); o+=4; return n; };
+  const u64=()=>{ const lo=v.getUint32(o,true),hi=v.getUint32(o+4,true); o+=8; return lo+hi*4294967296; };
+  const f32=()=>{ const n=v.getFloat32(o,true); o+=4; return n; };
+  const bool=()=>u8()!==0;
+  const skip=(n)=>{ o+=n; };
+  const line=()=>{ let s=''; while(o<u.length){ const c=u8(); if(c===0x0a)break; s+=String.fromCharCode(c); } return s; };
+
+  if(str(4)!=='SS+m') throw new Error('Not an SSPM file');
+  const version=u16();
+  if(version===1) return sspmV1(v,u,{get o(){return o},set o(n){o=n}},{str,u8,u16,u32,u64,f32,bool,skip,line});
+  if(version===2) return sspmV2(v,u,{get o(){return o},set o(n){o=n}},{str,u8,u16,u32,u64,f32,bool,skip,line});
+  throw new Error('Unsupported SSPM version: '+version);
+}
+
+function sspmV1(dv,ua,pos,r){
+  r.skip(2); // reserved
+  const id=r.line();
+  const rawName=r.line();
+  const parts=rawName.split(' - ');
+  const artist=parts.length>1?parts[0].trim():null;
+  const title=(parts.length>1?parts[1]:parts[0]).trim();
+  const mapperLine=r.line();
+  const mappers=mapperLine.split(/[&,]/).map(s=>s.trim());
+  const mapLength=r.u32();
+  const noteCount=r.u32();
+  const difficulty=r.u8();
+  const hasCover=r.u8()===2;
+  let coverBuf=null;
+  if(hasCover){ const n=Number(r.u64()); coverBuf=ua.slice(pos.o,pos.o+n); pos.o+=n; }
+  const hasAudio=r.bool();
+  let audioBuf=null, audioExt='ogg';
+  if(hasAudio){ const n=Number(r.u64()); audioBuf=ua.slice(pos.o,pos.o+n).buffer; pos.o+=n; }
+  const notes=[];
+  for(let i=0;i<noteCount;i++){
+    const ms=r.u32(); const quantum=r.bool();
+    let x,y;
+    if(quantum){x=r.f32();y=r.f32();}else{x=r.u8();y=r.u8();}
+    notes.push([ms, x-1, -(y-1)]);  // SSPM: origin top-left, Rhythia: origin center; flip Y
+  }
+  notes.sort((a,b)=>a[0]-b[0]);
+  notes.forEach((n,i)=>n._idx=i);
+  return {id,artist,title,mappers,difficulty,difficultyName:'',mapLength,notes,audioBuf,audioExt,coverBuf,hasCover:!!coverBuf,hasAudio:!!audioBuf};
+}
+
+function sspmV2(dv,ua,pos,r){
+  r.skip(4);  // reserved
+  r.skip(20); // hash
+  const mapLength=r.u32();
+  const noteCount=r.u32();
+  r.skip(4);  // marker count
+  const difficulty=r.u8();
+  r.skip(2);  // map rating
+  const hasAudio=r.bool();
+  const hasCover=r.bool();
+  r.skip(1);  // 1mod
+  const customDataOffset=r.u64();
+  const customDataLength=r.u64();
+  const audioByteOffset=r.u64();
+  const audioByteLength=r.u64();
+  const coverByteOffset=r.u64();
+  const coverByteLength=r.u64();
+  r.skip(16); // marker def offset+length
+  const markerByteOffset=r.u64();
+  r.skip(8);  // marker byte length
+  const idLen=r.u16(); const id=r.str(idLen);
+  const nameLen=r.u16(); const rawName=r.str(nameLen);
+  const parts=rawName.split(' - ');
+  const artist=parts.length>1?parts[0].trim():null;
+  const title=(parts.length>1?parts[1]:parts[0]).trim();
+  r.skip(r.u16()); // song name (different field)
+  const mapperCount=r.u16();
+  const mappers=[];
+  for(let i=0;i<mapperCount;i++){ const n=r.u16(); mappers.push(r.str(n)); }
+  // custom data: difficulty name
+  let difficultyName='';
+  pos.o=Number(customDataOffset);
+  r.skip(2); // field count
+  const fieldName=r.str(r.u16());
+  if(fieldName==='difficulty_name'){
+    const typeTag=r.u8();
+    let len=0;
+    if(typeTag===9) len=r.u16();
+    else if(typeTag===11) len=r.u32();
+    difficultyName=r.str(len);
+  }
+  let audioBuf=null, audioExt='ogg';
+  if(hasAudio){ pos.o=Number(audioByteOffset); audioBuf=ua.slice(pos.o,pos.o+Number(audioByteLength)).buffer; }
+  let coverBuf=null;
+  if(hasCover){ pos.o=Number(coverByteOffset); coverBuf=ua.slice(pos.o,pos.o+Number(coverByteLength)); }
+  pos.o=Number(markerByteOffset);
+  const notes=[];
+  for(let i=0;i<noteCount;i++){
+    const ms=r.u32();
+    r.skip(1); // marker type
+    const quantum=r.bool();
+    let x,y;
+    if(quantum){x=r.f32();y=r.f32();}else{x=r.u8();y=r.u8();}
+    notes.push([ms, x-1, -(y-1)]);
+  }
+  notes.sort((a,b)=>a[0]-b[0]);
+  notes.forEach((n,i)=>n._idx=i);
+  return {id,artist,title,mappers,difficulty,difficultyName,mapLength,notes,audioBuf,audioExt,coverBuf,hasCover:!!coverBuf,hasAudio:!!audioBuf};
+}
+
+async function importSSPM(file, fromIDB=false){
+  const buf=await file.arrayBuffer();
+  const data=readSSPM(buf);
+  let audio=null;
+  if(data.hasAudio && data.audioBuf){
+    ensureACtx();
+    audio=await actx.decodeAudioData(data.audioBuf);
+  }
+  let coverURL=null;
+  if(data.hasCover && data.coverBuf){
+    coverURL=URL.createObjectURL(new Blob([data.coverBuf],{type:'image/png'}));
+  }
+  const meta={
+    ID:data.id||file.name, Title:data.title, Artist:data.artist||'',
+    Mappers:data.mappers, Difficulty:data.difficulty,
+    DifficultyName:data.difficultyName, Length:data.mapLength,
+    HasAudio:data.hasAudio, HasCover:data.hasCover, AudioExt:data.audioExt
+  };
+  const nts=data.notes.map((n,i)=>[n[0],n[1],n[2]]);
+  const ex=maps.findIndex(m=>m.meta.ID===meta.ID);
+  if(ex>=0 && maps[ex].coverURL) URL.revokeObjectURL(maps[ex].coverURL);
+  const entry={meta,notes:nts,audio,builtin:false,name:file.name,coverURL};
+  if(ex>=0){maps[ex]=entry;selIdx=ex;}else{maps.push(entry);selIdx=maps.length-1;}
+  if(!fromIDB) await saveMapIDB(meta.ID||file.name, file.name, buf);
+  renderList(); showMapInfo(selIdx);
+}
+const maps = [];
+let selIdx = -1;
+
+function loadBuiltin(){
+  if(typeof META==='undefined'||typeof RNOTES==='undefined') return;
+  maps.push({meta:META, notes:RNOTES, audio:null, builtin:true, name:'NS22 (built-in)'});
+  selIdx=0; renderList(); showMapInfo(0);
+}
+
+async function importPHXM(file, fromIDB=false){
+  const zip  = await unzipSTORE(file);
+  const meta = JSON.parse(await zip.file('metadata.json').async('string'));
+  const nts  = parsePHXMO(await zip.file('objects.phxmo').async('arraybuffer'));
+  let audio  = null;
+  if(meta.HasAudio){
+    const e=zip.file(`audio.${meta.AudioExt||'ogg'}`);
+    if(e){ ensureACtx(); audio=await actx.decodeAudioData(await e.async('arraybuffer')); }
+  }
+  // Cover art
+  let coverURL = null;
+  if(meta.HasCover){
+    const ce=zip.file('cover.png');
+    if(ce){
+      const cb=await ce.async('arraybuffer');
+      coverURL=URL.createObjectURL(new Blob([cb],{type:'image/png'}));
+    }
+  }
+  const ex=maps.findIndex(m=>m.meta.ID===meta.ID);
+  // Revoke old cover URL if replacing
+  if(ex>=0 && maps[ex].coverURL) URL.revokeObjectURL(maps[ex].coverURL);
+  const entry={meta,notes:nts,audio,builtin:false,name:file.name,coverURL};
+  if(ex>=0){maps[ex]=entry;selIdx=ex;} else{maps.push(entry);selIdx=maps.length-1;}
+  if(!fromIDB) await saveMapIDB(meta.ID||file.name, file.name, await file.arrayBuffer());
+  renderList(); showMapInfo(selIdx);
+}
+
+// ─── Map UI  ─────────────────────────────────────────────────
+const fmtTime = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const el  = id => document.getElementById(id);
+const setT= (id,v) => { const e=el(id); if(e) e.textContent=v; };
+const setH= (id,v) => { const e=el(id); if(e) e.innerHTML=v; };
+
+function renderList(){
+  const ul=el('map-list-inner'); if(!ul) return;
+  ul.innerHTML='';
+  if(!maps.length){ul.innerHTML='<div class="import-hint">Drop <strong>.phxm</strong> or <strong>.sspm</strong> files here or click <strong>+ Import</strong></div>';return;}
+  maps.forEach((m,i)=>{
+    const di=Math.max(0,Math.min(5,m.meta.Difficulty||0));
+    const d=DIFFICULTIES[di], c=DIFF_COLORS[di];
+    const len=m.meta.Length?fmtTime(m.meta.Length/1000):'?:??';
+    const row=document.createElement('div');
+    row.className='map-entry'+(i===selIdx?' selected':'');
+    row.dataset.i=i;
+    const covHtml=m.coverURL
+      ? `<div class="me-cov"><img src="${m.coverURL}" alt=""></div>`
+      : `<div class="me-cov"></div>`;
+    row.innerHTML=`${covHtml}<div class="me-inf"><div class="me-t">${esc(m.meta.Title||'?')}</div><div class="me-a">${esc(m.meta.Artist||'?')}</div><div class="me-d" style="color:${c}">■ ${d} · ${m.notes.length} notes · ${len}</div></div>${m.builtin?'':'<button class="me-del" title="Remove map">✕</button>'}`;
+    row.addEventListener('click',()=>selectMap(i));
+    if(!m.builtin){
+      row.querySelector('.me-del')?.addEventListener('click',async e=>{
+        e.stopPropagation();
+        const id=maps[i].meta?.ID||maps[i].name;
+        if(maps[i].coverURL) URL.revokeObjectURL(maps[i].coverURL);
+        await deleteMapIDB(id);
+        maps.splice(i,1);
+        if(selIdx>=i) selIdx=Math.max(0,selIdx-1);
+        renderList();
+        if(maps.length) showMapInfo(selIdx);
+      });
+    }
+    ul.appendChild(row);
+  });
+}
+function selectMap(i){
+  selIdx=i;
+  document.querySelectorAll('.map-entry').forEach(e=>e.classList.toggle('selected',+e.dataset.i===i));
+  showMapInfo(i);
+  // SoundManager: play jukebox for newly selected map if in menu/play state
+  if(gState==='menu' && maps[i]?.audio){
+    jukeboxPlay(i, 0);
+  }
+}
+function showMapInfo(i){
+  if(i<0||i>=maps.length) return;
+  const m=maps[i];
+  const di=Math.max(0,Math.min(5,m.meta.Difficulty||0));
+  const d=DIFFICULTIES[di], c=DIFF_COLORS[di];
+  const len=m.meta.Length?fmtTime(m.meta.Length/1000):'?:??';
+  setT('mi-title', m.meta.Title||'?');
+  setH('mi-diff',  `<span style="color:${c}">${d}</span>${m.meta.DifficultyName?' - '+esc(m.meta.DifficultyName):''}`);
+  setT('mi-mapper','by '+(m.meta.Mappers||[]).join(', '));
+  setT('mi-notes', m.notes.length+' notes');
+  setT('mi-len',   len);
+  setT('play-footer-title',(m.meta.Artist?m.meta.Artist+' - ':'')+(m.meta.Title||''));
+  setT('song-title',(m.meta.Artist?m.meta.Artist+' - ':'')+(m.meta.Title||''));
+  // Update cover in info panel
+  const cov=el('mi-cover-el');
+  if(cov){
+    if(m.coverURL) cov.innerHTML=`<img src="${m.coverURL}" alt="cover">`;
+    else           cov.innerHTML='<span>NO COVER</span>';
+  }
+  // Update jukebox title
+  setT('jukebox-title',(m.meta.Artist?m.meta.Artist+' - ':'')+(m.meta.Title||'?'));
+}
+
+// ─── Audio  ──────────────────────────────────────────────────
+let actx, masterG, musicG, sfxG, audioSrc, audioStart, hitBuf, failBuf;
+let aOffset=0;
+
+function ensureACtx(){
+  if(actx) return;
+  actx=new (window.AudioContext||window.webkitAudioContext)();
+  masterG=actx.createGain(); masterG.connect(actx.destination);
+  musicG=actx.createGain(); musicG.connect(masterG);
+  sfxG=actx.createGain();   sfxG.connect(masterG);
+  applyVols();
+}
+function applyVols(){
+  if(!masterG) return;
+  masterG.gain.value = 1;  // master baked into each bus via C# formula
+  // C#: Song.VolumeDb    = -80 + 70 * pow(music/100, 0.1) * pow(master/100, 0.1)
+  // C#: HitSound.VolumeDb = -80 + 80 * pow(sfx/100, 0.1) * pow(master/100, 0.1)
+  // Convert dB → linear: gain = 10^(dB/20)
+  const m=S.volumeMaster/100, mu=S.volumeMusic/100, sfx=S.volumeSFX/100;
+  musicG.gain.value = m===0||mu===0 ? 0 : Math.pow(10,(-80+70*Math.pow(mu,0.1)*Math.pow(m,0.1))/20);
+  sfxG.gain.value   = m===0||sfx===0 ? 0 : Math.pow(10,(-80+80*Math.pow(sfx,0.1)*Math.pow(m,0.1))/20);
+}
+async function loadSFX(){
+  ensureACtx(); if(hitBuf&&failBuf) return;
+  const [h,f]=await Promise.all([fetch('hit.mp3'),fetch('fail.mp3')]);
+  [hitBuf,failBuf]=await Promise.all([actx.decodeAudioData(await h.arrayBuffer()),actx.decodeAudioData(await f.arrayBuffer())]);
+}
+async function ensureBuiltinAudio(){
+  const m=maps[0]; if(!m||!m.builtin||m.audio) return;
+  ensureACtx();
+  m.audio=await actx.decodeAudioData(await (await fetch('map_audio.ogg')).arrayBuffer());
+}
+function playMusic(buf,offset){
+  try{audioSrc&&audioSrc.stop();}catch{}
+  audioSrc=actx.createBufferSource();
+  audioSrc.buffer=buf; audioSrc.playbackRate.value=gSpeed;
+  audioSrc.connect(musicG); audioSrc.start(0,offset);
+  audioStart=actx.currentTime-offset/gSpeed;
+  audioSrc.onended=()=>{ if(gState==='playing') finishGame(); };
+}
+function sfx(buf,vol=1){
+  if(!buf||!actx) return;
+  const s=actx.createBufferSource(), g=actx.createGain();
+  g.gain.value=vol; s.buffer=buf; s.connect(g); g.connect(sfxG); s.start();
+}
+// Current song position in ms (what the original calls CurrentAttempt.Progress)
+const songMs=()=>(actx.currentTime-audioStart)*1000*gSpeed;
+
+// ─── Input  ──────────────────────────────────────────────────
+const cPos=new THREE.Vector2();  // clamped game-space cursor position
+const rawPos=new THREE.Vector2();
+let locked=false;
+
+// Mouse always tracked so cursor is visible in menus too
+document.addEventListener('mousemove', e=>{
+  const sens = S.sensitivity * (S.fov/70);  // UpdateCursor: sensitivity *= FoV/70
+  if(gState==='playing'){
+    if(S.absoluteInput){
+      // C# UpdateCursor with AbsoluteInput:
+      //   Reset cursor/raw to zero each frame, then:
+      //   AbsolutePosition = eventMouseMotion.Position - (WindowSize / 2)
+      //   UpdateCursor(AbsolutePosition * 0.582f)
+      rawPos.set(0,0); cPos.set(0,0);
+      const absX = (e.clientX - innerWidth/2)  * 0.582;
+      const absY = (e.clientY - innerHeight/2) * 0.582;
+      const dx = absX, dy = -absY;
+      if(S.cursorDrift){
+        cPos.x=clamp(dx/120*sens,   -BOUNDS, BOUNDS);
+        cPos.y=clamp(dy/120*sens,   -BOUNDS, BOUNDS);
+      } else {
+        cPos.x=clamp(dx/120*sens,-BOUNDS,BOUNDS);
+        cPos.y=clamp(dy/120*sens,-BOUNDS,BOUNDS);
+      }
+    } else if(locked){
+      // Relative (pointer-locked): UpdateCursor(mouseDelta)
+      const dx=e.movementX, dy=e.movementY;
+      if(S.cursorDrift){
+        cPos.x=clamp(cPos.x + dx/120*sens,   -BOUNDS, BOUNDS);
+        cPos.y=clamp(cPos.y - dy/120*sens,   -BOUNDS, BOUNDS);
+      } else {
+        rawPos.x+=dx/120*sens; rawPos.y-=dy/120*sens;
+        cPos.x=clamp(rawPos.x,-BOUNDS,BOUNDS);
+        cPos.y=clamp(rawPos.y,-BOUNDS,BOUNDS);
+      }
+    }
+  } else {
+    // Menu/results: map viewport to game-space for cursor display
+    const nx=(e.clientX/innerWidth)*2-1, ny=-(e.clientY/innerHeight)*2+1;
+    const vf=Math.tan(THREE.MathUtils.degToRad(S.fov)/2);
+    const hf=vf*cam.aspect;
+    cPos.x=clamp(nx*hf*3.75,-BOUNDS,BOUNDS);
+    cPos.y=clamp(ny*vf*3.75,-BOUNDS,BOUNDS);
+  }
+  cursorMesh.position.set(cPos.x, cPos.y, 0.001);
+  // Camera parallax (UpdateCursor: Camera.Position = (0,0,3.75) + cursorPos * parallax)
+  if(gState==='playing')
+    cam.position.set(cPos.x*S.cameraParallax, cPos.y*S.cameraParallax, 3.75);
+});
+
+// Only lock pointer when NOT using absolute input
+canvas.addEventListener('click',()=>{
+  if(gState==='playing' && !locked && !S.absoluteInput) canvas.requestPointerLock();
+});
+document.addEventListener('pointerlockchange',()=>{ locked=document.pointerLockElement===canvas; });
+
+function clamp(v,a,b){ return v<a?a:v>b?b:v; }
+
+// ─── Game state  ─────────────────────────────────────────────
+let gState='menu';   // menu | countdown | playing | paused | results
+let gNotes=[], gIdx=0, active=[], judged=new Set();
+let hits=0,misses=0,sum=0,combo=0,maxCombo=0;
+let cMult=1,cProg=0,cInc=6;
+let health=100, hStep=15;
+let score=0, accuracy=100, alive=true, qualifies=true;
+let mapLen=0, skippable=false, skipAlpha=0, gSpeed=1;
+let modNoFail=false, modGhost=false, modSpin=false, modFlashlight=false, modChaos=false, modHardRock=false, modsMultiplier=1;
+let gRaf, lastT=0;
+let deathTime=-1;  // ms into song when player died, -1 if no death (for graph)
+// Smoothed health for display (lerped like Godot)
+let healthDisplay=100;
+// Hit timings for graph
+const timings=[];
+
+// ─── Replay system  ──────────────────────────────────────────
+let replayData=null;
+const REPLAYS_KEY='rhythia_replays';
+function recordReplay(){
+  if(!S.recordReplays) return;
+  const replay={
+    mapID:maps[selIdx]?.meta?.ID||'unknown',
+    mapName:maps[selIdx]?.meta?.Title||'unknown',
+    timestamp:Date.now(),
+    speed:gSpeed,
+    ar:S.approachRate, ad:S.approachDistance, fadeIn:S.fadeIn,
+    fadeOut:S.fadeOut, pushback:S.pushback, noteOpacity:S.noteOpacity, noteSize:S.noteSize,
+    mods:{noFail:modNoFail,ghost:modGhost,spin:modSpin,flashlight:modFlashlight,chaos:modChaos,hardRock:modHardRock},
+    score, accuracy, combo:maxCombo, health:alive?100:0, hits, misses, alive, qualifies,
+    rank:(accuracy===100&&alive)?'SS':accuracy>=95?'S':accuracy>=88?'A':accuracy>=78?'B':accuracy>=65?'C':'D',
+    timings, deathTime
+  };
+  replayData=replay;
+  saveReplay(replay);
+}
+function saveReplay(replay){
+  try{
+    let replays=JSON.parse(localStorage.getItem(REPLAYS_KEY)||'[]');
+    if(!Array.isArray(replays)) replays=[];
+    replays.push(replay);
+    // Keep only last 20 replays to save storage
+    if(replays.length>20) replays=replays.slice(-20);
+    localStorage.setItem(REPLAYS_KEY,JSON.stringify(replays));
+    console.log('Replay saved');
+  }catch(e){console.warn('Failed to save replay',e);}
+}
+function loadReplays(){
+  try{
+    const replays=JSON.parse(localStorage.getItem(REPLAYS_KEY)||'[]');
+    return Array.isArray(replays)?replays:[];
+  }catch(e){console.warn('Failed to load replays',e);return[];}
+}
+
+// ─── HUD elements  ───────────────────────────────────────────
+const E = {
+  score:    el('hud-score'),  acc:   el('hud-acc'),
+  hits:     el('hud-hits'),   miss:  el('hud-miss'),
+  sum:      el('hud-sum'),    mult:  el('hud-mult'),
+  combo:    el('hud-combo'),
+  hFill:    el('health-fill'),
+  pFill:    el('prog-fill'),
+  time:     el('song-time'),
+  skip:     el('skip-lbl'),
+  fps:      el('fps-el'),
+  simpleMiss:el('simple-miss'),
+  ringCv:   el('ring-cv'),
+  popups:   el('popups'),
+  bgCv:     el('bg-canvas'),
+};
+const ringCtx = E.ringCv ? E.ringCv.getContext('2d') : null;
+let ringSmooth=0;
+let fpsTick=0, fpsLast=0, fpsVal=0;
+
+function showBg(v){ if(E.bgCv) E.bgCv.style.display=v?'':'none'; }
+
+// ─── Cursor visibility ───────────────────────────────────────
+// active=true  → 3D mesh cursor, no OS cursor (gameplay)
+// active=false → hide 3D mesh, show OS cursor (menus/results/pause)
+function setGameCursor(active){
+  cursorMesh.visible = active;
+  if(!active) trailPool.forEach(t=>t.visible=false);
+  document.body.style.cursor = active ? 'none' : '';
+}
+
+// ─── HUD render  ─────────────────────────────────────────────
+function updateHUD(dt=0){
+  const tgt = cMult>=8 ? 1 : cProg/cInc;
+  ringSmooth = dt>0 ? ringSmooth+(tgt-ringSmooth)*Math.min(1,dt*16) : tgt;
+
+  if(!S.simpleHUD){
+    if(E.score)  E.score.textContent = padMag(score);
+    if(E.acc)    E.acc.textContent   = ((hits+misses===0)?'100.00':accuracy.toFixed(2))+'%';
+    if(E.hits)   E.hits.textContent  = hits;
+    if(E.miss)   E.miss.textContent  = misses;
+    if(E.sum)    E.sum.textContent   = padMag(sum);
+    if(E.mult)   E.mult.textContent  = cMult+'x';
+  }
+  if(E.combo){
+    E.combo.textContent = combo;
+    // Real game: starts at modulate=Color(1,1,1,0), becomes visible on hit
+    E.combo.style.color = combo > 0 ? 'rgba(255,255,255,.42)' : 'rgba(255,255,255,0)';
+  }
+  if(E.simpleMiss) E.simpleMiss.textContent = misses;
+
+  // Health bar: width = (32 + health * 10.24) / 1088 * 100%  (LegacyRunner.cs line 1015)
+  if(E.hFill){
+    const w = (32 + healthDisplay*10.24)/1088*100;
+    E.hFill.style.width = w.toFixed(2)+'%';
+  }
+  drawRing();
+}
+
+function drawRing(){
+  if(!ringCtx||!E.ringCv) return;
+  const W=E.ringCv.width, H=E.ringCv.height, cx=W/2, cy=H/2, r=45, lw=5;
+  ringCtx.clearRect(0,0,W,H);
+  const sides = Math.max(3,Math.min(32,cInc));
+  // Background track
+  ringCtx.beginPath();
+  for(let i=0;i<sides;i++){
+    const a=-Math.PI/2+i*Math.PI*2/sides;
+    i===0?ringCtx.moveTo(cx+r*Math.cos(a),cy+r*Math.sin(a)):ringCtx.lineTo(cx+r*Math.cos(a),cy+r*Math.sin(a));
+  }
+  ringCtx.closePath(); ringCtx.strokeStyle='rgba(255,255,255,.13)'; ringCtx.lineWidth=lw; ringCtx.stroke();
+  // Fill arc
+  if(ringSmooth>0){
+    const tot=Math.PI*2*ringSmooth, step=Math.PI*2/sides; let drawn=0;
+    ringCtx.beginPath();
+    for(let i=0;i<sides;i++){
+      const a0=-Math.PI/2+i*step, seg=Math.min(step,Math.max(0,tot-drawn));
+      if(seg<=0) break; ringCtx.arc(cx,cy,r,a0,a0+seg); drawn+=seg;
+    }
+    ringCtx.strokeStyle=cMult>=8?'#ff8c00':'#ffffff'; ringCtx.lineWidth=lw; ringCtx.stroke();
+  }
+}
+
+function updateProg(ms){
+  // progressBarTexture.Size = (32 + progress/mapLen * 1024, 80)  (LegacyRunner.cs 1016)
+  const w=(32+Math.max(0,Math.min(1,ms/mapLen))*1024)/1088*100;
+  if(E.pFill) E.pFill.style.width=w.toFixed(3)+'%';
+  if(E.time)  E.time.textContent=fmtTime(Math.max(0,ms)/1000)+' / '+fmtTime(mapLen/1000);
+}
+
+function updateSkip(ms, dt){
+  const next = gIdx<gNotes.length ? gNotes[gIdx].ms : mapLen+BREAK_TIME;
+  const prev = gIdx>0 ? gNotes[gIdx-1].ms : 0;
+  // LegacyRunner: nextNote - progress >= BREAK_TIME * speed
+  skippable = (next-ms >= BREAK_TIME*gSpeed) && (next-BREAK_TIME-prev >= 1000*gSpeed);
+  // skipLabelAlpha lerps toward target  (LegacyRunner: Lerp(skipAlpha, target, min(1,delta*20)))
+  skipAlpha += ((skippable?100/255:0)-skipAlpha)*Math.min(1,dt*20);
+  if(E.skip){
+    // Pulse when skippable (LegacyRunner: sin(PI*now/750000) for progress label)
+    const pulse = skippable ? (0.7+0.3*Math.sin(Math.PI*performance.now()/750)) : 1;
+    E.skip.style.opacity=(skipAlpha*pulse).toFixed(3);
+  }
+}
+
+// ─── Hit / Miss  (Attempt.Hit / Attempt.Miss in LegacyRunner.cs) ─
+function doHit(n){
+  // lateness = (progress - note.ms) / speed  — positive = hit late
+  const lat = (songMs()-n.ms)/gSpeed;
+  // factor = 1 - max(0, lateness - 25) / 150
+  const factor = 1 - Math.max(0, lat-25)/150;
+  hits++; sum++; combo++;
+  cProg++;
+  if(cProg===cInc && cMult<8){ cProg=(cMult===7?cInc:0); cMult++; }
+  maxCombo=Math.max(maxCombo,combo);
+  // hitScore = 100 * ComboMultiplier * ModsMultiplier * factor * ((Speed-1)/2.5+1)
+  const pts=Math.round(100*cMult*modsMultiplier*factor*((gSpeed-1)/2.5+1));
+  score+=pts;
+  hStep=Math.max(hStep/1.45,15);
+  health=Math.min(100,health+hStep/1.75);
+  accuracy=Math.floor(hits/sum*10000)/100;
+  timings.push({ms:n.ms, lat});
+  if(!S.alwaysPlayHitSound) sfx(hitBuf,0.6);
+  if(S.hitPopups) spawnHitPopup(n.x,pts);
+  if(S.spaceHitEffects) spawnSpaceHitEffect(n.x, n.y);
+  updateHUD(); comboPop();
+}
+function doMiss(n){
+  misses++; sum++;
+  combo=0; cProg=0; cMult=Math.max(1,cMult-1);
+  health=Math.max(0,health-hStep); hStep=Math.min(hStep*1.2,100);
+  accuracy=Math.floor(hits/sum*10000)/100;
+  timings.push({ms:n.ms, lat:null});
+  if(S.missPopups) spawnMissPopup(n.x);
+  updateHUD();
+  if(health<=0&&alive){ alive=false; qualifies=false; onDeath(); }
+}
+function onDeath(){
+  sfx(failBuf);
+  deathTime = songMs();   // record death position for the graph (LegacyRunner: DeathTime = Progress)
+  // Dim health bar to 50% opacity (LegacyRunner: healthTexture.Modulate = Color8(255,255,255,128))
+  if(E.hFill){ E.hFill.style.opacity='0.5'; }
+  const ov=el('dead-ov'); if(ov){ov.style.display='block'; setTimeout(()=>{ov.style.display='none';},400);}
+  if(!modNoFail) setTimeout(()=>{if(gState==='playing')finishGame(true);},1200);
+}
+
+let cpRaf;
+function comboPop(){
+  if(!E.combo) return;
+  E.combo.classList.remove('pop');
+  cancelAnimationFrame(cpRaf);
+  cpRaf=requestAnimationFrame(()=>{ E.combo.classList.add('pop'); setTimeout(()=>E.combo.classList.remove('pop'),120); });
+}
+
+// ─── Popups  ─────────────────────────────────────────────────
+// Both spawn at world y=-1.4, z=0  (LegacyRunner.cs lines 302, 362)
+function w2s(wx,wy){
+  const v=new THREE.Vector3(wx,wy,0); v.project(cam);
+  return{x:(v.x+1)/2*innerWidth, y:(-v.y+1)/2*innerHeight};
+}
+// popup count trackers — C# caps both at 64 active popups
+let hitPopupCount=0, missPopupCount=0;
+
+function spawnHitPopup(nx,val){
+  if(hitPopupCount>=64) return;
+  hitPopupCount++;
+  const p=w2s(nx,-1.4), d=document.createElement('div');
+  d.className='hit-popup'; d.textContent=val;
+  d.style.cssText=`left:${p.x}px;top:${p.y}px`;
+  E.popups.appendChild(d);
+  requestAnimationFrame(()=>d.classList.add('rise'));
+  setTimeout(()=>{ d.remove(); hitPopupCount--; }, 550);
+}
+function spawnMissPopup(nx){
+  if(missPopupCount>=64) return;
+  missPopupCount++;
+  const p=w2s(nx,-1.4), d=document.createElement('div');
+  d.className='miss-icon'; d.style.cssText=`left:${p.x}px;top:${p.y}px`;
+  E.popups.appendChild(d);
+  requestAnimationFrame(()=>d.classList.add('fall'));
+  setTimeout(()=>{ d.remove(); missPopupCount--; }, 400);
+}
+
+// ─── Space hit effects  ──────────────────────────────────────
+let gridScaleAnim=1;
+function spawnSpaceHitEffect(nx, ny){
+  // Brief grid scale pulse on note hit
+  gridScaleAnim=1.05;
+  if(gridMesh) gridMesh.scale.setScalar(gridScaleAnim);
+}
+
+// ─── Main game loop  ─────────────────────────────────────────
+function loop(now){
+  gRaf=requestAnimationFrame(loop);
+  const dt=Math.min((now-lastT)/1000, 0.1); lastT=now;
+  // FPS counter
+  fpsTick++; if(now-fpsLast>=1000){fpsVal=fpsTick;fpsTick=0;fpsLast=now;}
+  if(E.fps&&S.displayFPS) E.fps.textContent=fpsVal+' FPS';
+
+  if(gState!=='playing'){ R.render(scene,cam); return; }
+
+  const ms=songMs();
+  const at=S.approachDistance/S.approachRate;  // approachTime = AD/AR
+  const ad=S.approachDistance;
+
+  // Lerp healthDisplay toward health  (Godot: lerp with delta*64)
+  healthDisplay+=(health-healthDisplay)*Math.min(1,dt*64);
+
+  // Grid scale animation (space hit effect pulse)
+  gridScaleAnim+=(1-gridScaleAnim)*Math.min(1,dt*12);
+  if(gridMesh) gridMesh.scale.setScalar(gridScaleAnim);
+
+  // Cursor rotation  (LegacyRunner: cursor.RotationDegrees += Vector3.Back * CursorRotation * delta)
+  if(S.cursorRotation) cursorMesh.rotation.z+=S.cursorRotation*(Math.PI/180)*dt;
+
+  updateTrail(cPos.x, cPos.y);
+
+  // AlwaysPlayHitSound: fire sfx at note's exact time (note.Hittable flag equivalent)
+  if(S.alwaysPlayHitSound){
+    for(let i=gIdx;i<gNotes.length&&gNotes[i].ms<=ms;i++){
+      if(!gNotes[i].soundPlayed){ gNotes[i].soundPlayed=true; sfx(hitBuf,0.6); }
+    }
+  }
+
+  // Spawn notes entering approach window
+  while(gIdx<gNotes.length && gNotes[gIdx].ms-ms <= at*1000*gSpeed){
+    if(!judged.has(gNotes[gIdx].idx)) spawnNote(gNotes[gIdx], ms, at, ad);
+    gIdx++;
+  }
+
+  // Process active notes
+  const remove=[];
+  for(const an of active){
+    const n=an.note;
+    if(judged.has(n.idx)){remove.push(an);continue;}
+
+    const timeToNote=n.ms-ms;
+    // depth = (note.ms - progress) / (1000 * at) * ad / speed  (LegacyRenderer.cs line)
+    const depth=(n.ms-ms)/(1000*at)*ad/gSpeed;
+
+    // Miss: note window expired
+    if(timeToNote < -HIT_WINDOW*gSpeed){
+      judged.add(n.idx); if(!n.hit) doMiss(n); remove.push(an); continue;
+    }
+
+    // Hit: cursor overlaps note (LegacyRunner.cs hit check)
+    if(timeToNote<=0 &&
+       cPos.x+HIT_BOX_SIZE >= n.x-0.5 && cPos.x-HIT_BOX_SIZE <= n.x+0.5 &&
+       cPos.y+HIT_BOX_SIZE >= n.y-0.5 && cPos.y-HIT_BOX_SIZE <= n.y+0.5){
+      n.hit=true; judged.add(n.idx); doHit(n); remove.push(an); continue;
+    }
+
+    // Position along Z — depth can go NEGATIVE when note has passed hit time
+    // With pushback=true: z = -depth (positive z = toward camera, note passes through hit plane)
+    // With pushback=false: clamped to 0 (handled by alpha=0 below)
+    an.obj.g.position.set(n.x, n.y, -depth);
+
+    // Alpha  (LegacyRenderer.cs exact)
+    // fadeIn: based on depth (positive = not yet reached, negative = past hit plane)
+    const fadeInPct = S.fadeIn/100;
+    let alpha = fadeInPct===0 ? 1 : Math.max(0,Math.min(1,(1-depth/ad)/fadeInPct));
+
+    if(modGhost){
+      // GhostMod.cs: alpha -= Min(1, (ad-depth)/(ad/2))
+      alpha -= Math.min(1, (ad-depth)/(ad/2));
+    } else if(S.fadeOut){
+      // hitWindowDepth = pushback ? HIT_WINDOW * ar / 1000 : 0
+      const hwd = S.pushback ? HIT_WINDOW*S.approachRate/1000 : 0;
+      alpha *= Math.min(1, (depth+hwd)/(ad+hwd));
+    }
+    // Pushback=false: zero alpha once note has passed time zero (clamp note at plane)
+    if(!S.pushback && timeToNote<=0) alpha=0;
+
+    alpha = Math.max(0,alpha)*S.noteOpacity;
+    an.obj.body.material.opacity  = alpha*0.95;
+    an.obj.bloom.material.opacity = alpha*0.38;
+  }
+  for(const an of remove){an.obj.g.visible=false; active.splice(active.indexOf(an),1);}
+
+  updateSkip(ms, dt);
+  updateProg(ms);
+  updateHUD(dt);
+
+  if(ms>=mapLen && gIdx>=gNotes.length && active.length===0){ finishGame(false); return; }
+  R.render(scene,cam);
+}
+
+function spawnNote(n, ms, at, ad){
+  const obj=getNoteObj();
+  const sc=getNoteScale();
+  obj.g.scale.setScalar(sc);
+  const col=NOTE_C[n.idx%2];
+  obj.body.material.color.set(col); obj.bloom.material.color.set(col);
+  // Spawn at actual depth (always positive here since note.ms > ms at spawn time)
+  const depth=(n.ms-ms)/(1000*at)*ad/gSpeed;
+  obj.g.position.set(n.x, n.y, -depth);
+  obj.g.visible=true;
+  active.push({note:n, obj});
+}
+
+// ─── Resize  ─────────────────────────────────────────────────
+function resize(){ R.setSize(innerWidth,innerHeight); cam.aspect=innerWidth/innerHeight; cam.updateProjectionMatrix(); }
+window.addEventListener('resize',resize); resize();
+
+// ─── Game flow  ──────────────────────────────────────────────
+async function startGame(){
+  if(selIdx<0||selIdx>=maps.length){toast('Select a map first');return;}
+  const m=maps[selIdx];
+  if(m.builtin&&!m.audio){showLoading('Loading audio…'); try{await ensureBuiltinAudio();}finally{hideLoading();}}
+  if(!m.audio){toast('Map has no audio');return;}
+  await loadSFX();
+  jukeboxStop();  // stop menu music before gameplay (SoundManager.Song.Stop() in LegacyRunner.Play)
+
+  S.approachRate     = +el('sl-ar').value;
+  S.approachDistance = +el('sl-ad').value;
+  gSpeed             = +el('sl-speed').value;
+  S.sensitivity      = +el('sl-sens').value;
+
+  modNoFail    = el('mod-nofail')?.classList.contains('on')||false;
+  modGhost     = el('mod-ghost')?.classList.contains('on')||false;
+  modSpin      = el('mod-spin')?.classList.contains('on')||false;
+  modFlashlight= el('mod-flashlight')?.classList.contains('on')||false;
+  modChaos     = el('mod-chaos')?.classList.contains('on')||false;
+  modHardRock  = el('mod-hardrock')?.classList.contains('on')||false;
+  // Constants.cs: MODS_MULTIPLIER_INCREMENT
+  modsMultiplier = 1 + (modGhost?0.0675:0) + (modSpin?0.18:0) + (modFlashlight?0.1:0) 
+                     + (modChaos?0.07:0) + (modHardRock?0.08:0);
+
+  cInc    = Math.max(2, Math.floor(m.notes.length/200));
+  // C#: MapLength = audioStream.GetLength()*1000 if audio, else Map.Length+1000; then += HIT_WINDOW
+  // We use the decoded AudioBuffer duration (most accurate), fallback to meta.Length+1000
+  const audioDuration = m.audio ? m.audio.duration * 1000 : null;
+  mapLen = (audioDuration !== null ? audioDuration : (m.meta.Length||0) + 1000) + HIT_WINDOW;
+
+  // Reset all state
+  hits=misses=sum=combo=maxCombo=score=0;
+  cMult=1;cProg=0;ringSmooth=0;
+  health=100;healthDisplay=100;hStep=15;accuracy=100;
+  alive=true;qualifies=true;skippable=false;skipAlpha=0;
+  deathTime=-1;
+  gIdx=0;judged=new Set();active=[];timings.length=0;
+  trailHist.length=0;
+  notePool.forEach(o=>{o.g.visible=false;o.g.scale.setScalar(1);});
+  trailPool.forEach(o=>o.visible=false);
+  E.popups.innerHTML='';
+  hitPopupCount=0; missPopupCount=0;
+  if(E.hFill) E.hFill.style.opacity='1';  // restore health bar opacity from any previous death
+  cursorMesh.rotation.z=0;
+  rawPos.set(0,0); cPos.set(0,0);
+  cursorMesh.position.set(0,0,0.001);
+  cam.position.set(0,0,3.75);
+
+  gNotes = m.notes.map((n,i)=>({idx:i, ms:n[0], x:n[1], y:n[2], hit:false, soundPlayed:false}));
+
+  // Set results info
+  const di=Math.max(0,Math.min(5,m.meta.Difficulty||0));
+  setT('r-title', (m.meta.Artist?m.meta.Artist+' - ':'')+(m.meta.Title||''));
+  setT('r-diff',  DIFFICULTIES[di]+(m.meta.DifficultyName?' - '+m.meta.DifficultyName:''));
+  setT('r-mapper','by '+(m.meta.Mappers||[]).join(', '));
+
+  // Transition to game
+  hideAll();
+  el('hud').style.display='block';
+
+  // SimpleHUD: hide panels, only show combo and miss count
+  el('panel-left').style.display  = S.simpleHUD?'none':'';
+  el('panel-right').style.display = S.simpleHUD?'none':'';
+  el('simple-miss-wrap').style.display = S.simpleHUD?'block':'none';
+
+  if(E.fps) E.fps.style.display=S.displayFPS?'':'none';
+
+  scene.background=new THREE.Color(0x06000f);
+  gridMesh.visible=true;
+  showBg(false);
+  setGameCursor(true);
+
+  updateHUD(); updateProg(0);
+  await countdown();
+
+  ensureACtx();
+  if(actx.state==='suspended') await actx.resume();
+  aOffset=0; playMusic(m.audio,0);
+  gState='playing'; lastT=performance.now();
+  loop(lastT);
+  if(!S.absoluteInput) canvas.requestPointerLock();
+}
+
+async function countdown(){
+  gState='countdown';
+  const d=el('countdown'); d.classList.add('vis');
+  for(let i=3;i>=1;i--){
+    d.textContent=i; d.style.opacity='1';
+    await wait(380); d.style.opacity='0'; await wait(620);
+  }
+  d.classList.remove('vis');
+}
+
+function pauseGame(){
+  if(gState!=='playing') return;
+  gState='paused'; qualifies=false;
+  aOffset=songMs()/1000;
+  try{audioSrc.stop();}catch{}
+  if(document.pointerLockElement) document.exitPointerLock();
+  setGameCursor(false);
+  el('scr-pause').classList.add('vis');
+  cancelAnimationFrame(gRaf);
+}
+function resumeGame(){
+  if(gState!=='paused') return;
+  el('scr-pause').classList.remove('vis');
+  setGameCursor(true);
+  const go=()=>{ playMusic(maps[selIdx].audio,aOffset); gState='playing'; lastT=performance.now(); loop(lastT); if(!S.absoluteInput) canvas.requestPointerLock(); };
+  actx.state==='suspended'?actx.resume().then(go):go();
+}
+function skipBreak(){
+  if(!skippable||gState!=='playing') return;
+  const next=gIdx<gNotes.length?gNotes[gIdx].ms:mapLen;
+  // LegacyRunner.cs Skip(): progress = nextNote.ms - approachTime * 1500 * speed
+  const to=(next - (S.approachDistance/S.approachRate)*1500*gSpeed)/1000;
+  try{audioSrc.stop();}catch{}
+  aOffset=Math.max(0,to);
+  playMusic(maps[selIdx].audio,aOffset);
+}
+
+function finishGame(failed=false){
+  const finalMs = actx ? songMs() : 0;  // capture before stop
+  gState='results';
+  recordReplay();  // save gameplay recording
+  cancelAnimationFrame(gRaf);
+  try{audioSrc.stop();}catch{}
+  if(document.pointerLockElement) document.exitPointerLock();
+  notePool.forEach(o=>o.g.visible=false);
+  trailPool.forEach(o=>o.visible=false);
+
+  const acc=sum?Math.floor(hits/sum*10000)/100:100;
+  const status=!alive?'FAILED':!qualifies?'DISQUALIFIED':'PASSED';
+  const rank=acc===100&&!failed?'SS':acc>=95?'S':acc>=88?'A':acc>=78?'B':acc>=65?'C':'D';
+
+  const rk=el('r-rank'); if(rk) rk.textContent=rank;
+  el('r-status').textContent=status;
+  el('r-status').className='r-status '+({'PASSED':'rs-p','FAILED':'rs-f','DISQUALIFIED':'rs-d'}[status]);
+  setT('r-score', padMag(score));
+  setT('r-acc',   acc.toFixed(2)+'%');
+  setT('r-combo', maxCombo);
+  setT('r-hits',  padMag(hits)+' / '+padMag(sum));
+  setT('r-misses',misses+(misses===1?' miss':' misses'));
+  setT('r-speed', gSpeed.toFixed(2)+'x');
+  const mStr=[modNoFail?'No Fail':'',modGhost?'Ghost':'',modSpin?'Spin':'',
+              modFlashlight?'Flashlight':'',modChaos?'Chaos':'',modHardRock?'Hard Rock':'']
+    .filter(Boolean).join(' + ');
+  setT('r-mods',  mStr||'—');
+
+  drawGraph();
+  el('hud').style.display='none';
+  el('scr-results').classList.add('vis');
+  // Set cover background image if map has a cover
+  const covBg=el('r-cover-bg');
+  if(covBg && maps[selIdx]?.coverURL) covBg.style.backgroundImage=`url(${maps[selIdx].coverURL})`;
+  else if(covBg) covBg.style.backgroundImage='none';
+  scene.background=null; gridMesh.visible=false; showBg(true);
+  setGameCursor(false);
+  // Results.cs _Ready: resume song from where gameplay ended
+  if(maps[selIdx]?.audio){
+    ensureACtx();
+    const replayOffset = Math.max(0, Math.min(finalMs/1000, maps[selIdx].audio.duration));
+    if(actx.state==='suspended') actx.resume().then(()=>playMusic(maps[selIdx].audio, replayOffset));
+    else playMusic(maps[selIdx].audio, replayOffset);
+  }
+  idleLoop();
+}
+
+function drawGraph(){
+  const cv=el('r-graph'); if(!cv) return;
+  const ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  ctx.clearRect(0,0,W,H);
+  // Black background (Graph.cs is a ColorRect, default black)
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  if(!timings.length) return;
+
+  const songLength = mapLen;   // total map length in ms
+
+  // Hit color: 00ff00ff (bright green), Miss color: ff000044 (semi-transparent red)
+  const hitColor  = '#00ff00';
+  const missColor = 'rgba(255,0,0,0.267)';  // 0x44/0xff ≈ 0.267
+
+  // ScoreDropoffLine: horizontal line at y=25ms (anchor_top=0.455), Color(1,1,1,0.125)
+  // This marks where score factor starts dropping (lat>25ms in doHit formula)
+  const dropY = Math.floor(25 / HIT_WINDOW * H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.125)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, dropY); ctx.lineTo(W, dropY); ctx.stroke();
+
+  timings.forEach(t => {
+    const x = Math.floor(t.ms / songLength * W);
+    if(t.lat === null){
+      // Miss: full-height red vertical line (Graph.cs: DrawLine from top to bottom)
+      ctx.strokeStyle = missColor; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke();
+    } else {
+      // Hit: 1×1 pixel, x=song position, y=lateness (0=top=perfect, 55ms=bottom)
+      const y = Math.floor(H * Math.min(1, Math.max(0, t.lat / HIT_WINDOW)));
+      ctx.fillStyle = hitColor;
+      ctx.fillRect(x, y, 1, 1);
+    }
+  });
+
+  // Death line: yellow, weight 3 (Graph.cs: Color.Color8(255,255,0))
+  if(deathTime >= 0){
+    const x = Math.floor(deathTime / songLength * W);
+    ctx.strokeStyle = '#ffff00'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke();
+  }
+}
+
+function toMenu(){
+  gState='menu'; cancelAnimationFrame(gRaf);
+  try{audioSrc&&audioSrc.stop();}catch{}
+  if(document.pointerLockElement) document.exitPointerLock();
+  notePool.forEach(o=>o.g.visible=false); trailPool.forEach(o=>o.visible=false);
+  active=[]; E.popups.innerHTML=''; hitPopupCount=0; missPopupCount=0;
+  rHolderX=0; rHolderY=0;
+  const rb=el('r-holder'); if(rb) rb.style.transform='';
+  hideAll();
+  el('scr-menu').style.display='block';
+  scene.background=null; gridMesh.visible=false; showBg(true);
+  setGameCursor(false);
+  R.render(scene,cam);
+  // Resume jukebox from the played map (Results.cs: SoundManager.PlayJukebox on load)
+  if(selIdx>=0 && maps[selIdx]?.audio) jukeboxPlay(selIdx, 0);
+  idleLoop();
+}
+
+function hideAll(){
+  // Screens use display:none / display:block now
+  ['scr-menu','scr-play'].forEach(id=>{const e=el(id);if(e)e.style.display='none';});
+  // Modals use .vis class
+  ['scr-pause','scr-results','settings-modal','countdown'].forEach(id=>{const e=el(id);if(e)e.classList.remove('vis');});
+  // HUD and overlays
+  const hud=el('hud'); if(hud)hud.style.display='none';
+  const dov=el('dead-ov'); if(dov)dov.style.display='none';
+}
+
+function idleLoop(){
+  if(gState!=='menu'&&gState!=='results') return;
+
+  // Results.cs _Process: holder drifts toward (size/2 - mousePos) * (8/size.Y)
+  if(gState==='results'){
+    const rb=el('r-holder');
+    if(rb){
+      const W=innerWidth,H=innerHeight,factor=8/H;
+      const tx=(W/2-rMouseX)*factor, ty=(H/2-rMouseY)*factor;
+      rHolderX+=(tx-rHolderX)*0.08; rHolderY+=(ty-rHolderY)*0.08;
+      rb.style.transform=`translate(${rHolderX.toFixed(2)}px,${rHolderY.toFixed(2)}px)`;
+    }
+  }
+
+  R.render(scene,cam); requestAnimationFrame(idleLoop);
+}
+
+// ─── Settings UI  ────────────────────────────────────────────
+function applySettings(){
+  cam.fov=S.fov; cam.updateProjectionMatrix();
+  applyCursorScale();
+  applyVols();
+  if(E.fps) E.fps.style.display=S.displayFPS?'':'none';
+}
+function syncPlaySliders(){
+  const set=(id,v,d)=>{const e=el(id);if(e){e.value=v;const d2=el(id+'-d');if(d2)d2.textContent=parseFloat(v).toFixed(d);}};
+  set('sl-ar',   S.approachRate,    0);
+  set('sl-ad',   S.approachDistance,1);
+  set('sl-sens', S.sensitivity,     2);
+}
+function populateSettings(){
+  const sl=(id,v,d)=>{const e=el(id);if(e){e.value=v;const d2=el(id+'-d');if(d2)d2.textContent=parseFloat(v).toFixed(d);}};
+  const tog=(id,v)=>{const b=el(id);if(b){b.textContent=v?'ON':'OFF';b.classList.toggle('on',!!v);}};
+  sl('s-sens',    S.sensitivity,    2);
+  sl('s-ar',      S.approachRate,   0);
+  sl('s-ad',      S.approachDistance,1);
+  sl('s-fadein',  S.fadeIn,         0);
+  sl('s-parallax',S.cameraParallax, 2);
+  sl('s-fov',     S.fov,            0);
+  tog('s-absInput',   S.absoluteInput);
+  tog('s-drift',      S.cursorDrift);
+  tog('s-fadeout',    S.fadeOut);
+  tog('s-pushback',   S.pushback);
+  sl('s-nopacity',S.noteOpacity,    2);
+  sl('s-nsize',   S.noteSize,       3);
+  sl('s-cscale',  S.cursorScale,    2);
+  sl('s-crot',    S.cursorRotation, 0);
+  sl('s-ttime',   S.trailTime,      2);
+  tog('s-ctrail',     S.cursorTrail);
+  tog('s-simplehud',  S.simpleHUD);
+  tog('s-hitpop',     S.hitPopups);
+  tog('s-misspop',    S.missPopups);
+  sl('s-volm',    S.volumeMaster,   0);
+  sl('s-volmu',   S.volumeMusic,    0);
+  sl('s-volsfx',  S.volumeSFX,      0);
+  tog('s-alwayssnd',  S.alwaysPlayHitSound);
+  tog('s-fps',        S.displayFPS);
+}
+function wireSettings(){
+  const sl=(id,key,dec,cb)=>{
+    const e=el(id); if(!e) return;
+    e.addEventListener('input',()=>{
+      S[key]=parseFloat(e.value); const d=el(id+'-d'); if(d) d.textContent=S[key].toFixed(dec);
+      if(cb) cb(S[key]); saveSettings();
+    });
+  };
+  const tog=(id,key,cb)=>{
+    const b=el(id); if(!b) return;
+    b.addEventListener('click',()=>{
+      S[key]=!S[key]; b.textContent=S[key]?'ON':'OFF'; b.classList.toggle('on',S[key]);
+      if(cb) cb(S[key]); saveSettings();
+    });
+  };
+  sl('s-sens',    'sensitivity',    2);
+  sl('s-ar',      'approachRate',   0, ()=>syncPlaySliders());
+  sl('s-ad',      'approachDistance',1,()=>syncPlaySliders());
+  sl('s-fadein',  'fadeIn',         0);
+  sl('s-parallax','cameraParallax', 2);
+  sl('s-hudpara', 'hudParallax',    2);
+  sl('s-fov',     'fov',            0, v=>{cam.fov=v;cam.updateProjectionMatrix();});
+  tog('s-absInput','absoluteInput');
+  tog('s-drift',   'cursorDrift');
+  tog('s-fadeout', 'fadeOut');
+  tog('s-pushback','pushback');
+  sl('s-nopacity','noteOpacity',  2);
+  sl('s-nsize',   'noteSize',     3);
+  sl('s-cscale',  'cursorScale',  2, ()=>applyCursorScale());
+  sl('s-crot',    'cursorRotation',0);
+  sl('s-ttime',   'trailTime',    2);
+  sl('s-tdetail', 'trailDetail',  2);
+  tog('s-ctrail', 'cursorTrail');
+  tog('s-usecuranim','useCursorInMenus');
+  sl('s-videodim','videoDim',     1);
+  sl('s-videors', 'videoRenderScale',1);
+  tog('s-simplehud','simpleHUD');
+  tog('s-hitpop', 'hitPopups');
+  tog('s-misspop','missPopups');
+  tog('s-spacehit','spaceHitEffects');
+  sl('s-volm',    'volumeMaster', 0, ()=>applyVols());
+  sl('s-volmu',   'volumeMusic',  0, ()=>applyVols());
+  sl('s-volsfx',  'volumeSFX',    0, ()=>applyVols());
+  tog('s-alwayssnd','alwaysPlayHitSound');
+  tog('s-autojuke','autojukeboxStart');
+  tog('s-fullscr','fullscreen',   v=>applyFullscreen());
+  tog('s-unlfps', 'unlockFPS');
+  sl('s-fpscap',  'fpsCap',       0);
+  tog('s-fps',    'displayFPS',      v=>{if(E.fps)E.fps.style.display=v?'':'none';});
+  tog('s-record', 'recordReplays');
+
+  // Tabs
+  document.querySelectorAll('.stab').forEach(b=>{
+    b.addEventListener('click',()=>{
+      document.querySelectorAll('.stab').forEach(x=>x.classList.remove('active'));
+      document.querySelectorAll('.s-sect').forEach(x=>x.style.display='none');
+      b.classList.add('active');
+      const s=el(b.dataset.sec); if(s) s.style.display='block';
+    });
+  });
+
+  // Settings profiles
+  el('s-save-profile')?.addEventListener('click',()=>{
+    const name=prompt('Save as profile:',currentProfile);
+    if(name){saveProfile(name);toast(`Saved profile: ${name}`);}
+  });
+  el('s-load-profile')?.addEventListener('click',()=>{
+    const list=Object.keys(profiles).filter(p=>p!=='default').join(', ') || 'none';
+    const name=prompt('Load profile (available: '+list+'):',currentProfile);
+    if(name&&profiles[name]){loadProfile(name);}
+  });
+  el('s-del-profile')?.addEventListener('click',()=>{
+    if(currentProfile!=='default'&&confirm(`Delete profile "${currentProfile}"?`)){
+      deleteProfile(currentProfile); toast(`Deleted profile: ${currentProfile}`);
+    }
+  });
+
+  // Reset
+  el('s-reset')?.addEventListener('click',()=>{
+    if(confirm('Reset all settings to defaults?')){ Object.assign(S,DEFAULTS); saveSettings(); applySettings(); populateSettings(); syncPlaySliders(); toast('Settings reset'); }
+  });
+
+  // Play-screen sliders (AR/AD/Speed/Sens) display sync
+  [['sl-ar',0],['sl-ad',1],['sl-speed',2],['sl-sens',2]].forEach(([id,dec])=>{
+    const e=el(id); if(!e) return;
+    e.addEventListener('input',()=>{ const d=el(id+'-d'); if(d) d.textContent=parseFloat(e.value).toFixed(dec); });
+  });
+}
+
+// ─── Mod buttons  ─────────────────────────────────────────────
+function setupMods(){
+  document.querySelectorAll('.mod-btn').forEach(b=>{
+    b.addEventListener('click',()=>{ b.classList.toggle('on'); });
+  });
+}
+
+// ─── Import  ─────────────────────────────────────────────────
+function setupImport(){
+  const zone=el('scr-play'), inp=el('phxm-input'), btn=el('btn-import');
+  if(!zone) return;
+  zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag-over');});
+  zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag-over');});
+  zone.addEventListener('drop',async e=>{e.preventDefault();zone.classList.remove('drag-over');await handleFiles([...e.dataTransfer.files]);});
+  btn?.addEventListener('click',()=>inp?.click());
+  inp?.addEventListener('change',async()=>{await handleFiles([...inp.files]);inp.value='';});
+}
+async function handleFiles(files){
+  const maps_f=files.filter(f=>/\.(phxm|sspm)$/i.test(f.name));
+  if(!maps_f.length){toast('No .phxm or .sspm files');return;}
+  showLoading(`Importing ${maps_f.length} map${maps_f.length>1?'s':''}…`);
+  let ok=0;
+  for(const f of maps_f){
+    try{
+      if(f.name.toLowerCase().endsWith('.sspm')) await importSSPM(f);
+      else await importPHXM(f);
+      ok++;
+    }catch(e){console.error(e);toast('Failed: '+f.name);}
+  }
+  hideLoading(); if(ok) toast(`Imported ${ok} map${ok>1?'s':''}`);
+}
+
+// ─── Search / random  ─────────────────────────────────────────
+function setupSearch(){
+  function filterMaps(){
+    const q=(el('search-box')?.value||'').toLowerCase();
+    const qa=(el('search-author-box')?.value||'').toLowerCase();
+    document.querySelectorAll('.map-entry').forEach(r=>{
+      const t=(r.querySelector('.me-t')?.textContent||'').toLowerCase();
+      const a=(r.querySelector('.me-a')?.textContent||'').toLowerCase();
+      r.style.display=(t.includes(q)&&a.includes(qa))?'':'none';
+    });
+  }
+  el('search-box')?.addEventListener('input',filterMaps);
+  el('search-author-box')?.addEventListener('input',filterMaps);
+  el('btn-random')?.addEventListener('click',()=>{ if(maps.length) selectMap(Math.floor(Math.random()*maps.length)); });
+}
+
+// ─── Keyboard shortcuts  ──────────────────────────────────────
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){
+    if(gState==='playing') pauseGame();
+    else if(gState==='paused') resumeGame();
+    else if(gState==='results') toMenu();   // Results.cs: Esc → Stop() → MainMenu
+    else { const sm=el('settings-modal'); if(sm?.classList.contains('vis')) sm.classList.remove('vis'); }
+  }
+  if(e.code==='Space'&&gState==='playing'){ e.preventDefault(); skipBreak(); }
+  if(e.key==='`'){
+    if(gState==='playing'){ cancelAnimationFrame(gRaf); try{audioSrc&&audioSrc.stop();}catch{} startGame(); }
+    else if(gState==='results') startGame(); // Results.cs: backtick → Replay()
+  }
+  // Hotkeys: F=fadeOut, P=pushback  (LegacyRunner.cs _Input)
+  if(e.key==='f'&&gState==='playing'){ S.fadeOut=!S.fadeOut; saveSettings(); toast('Fade Out: '+(S.fadeOut?'ON':'OFF')); }
+  if(e.key==='p'&&gState==='playing'){ S.pushback=!S.pushback; saveSettings(); toast('Pushback: '+(S.pushback?'ON':'OFF')); }
+  // Fullscreen toggle (F11 or Alt+Enter)
+  if((e.key==='F11'||e.key==='F'&&e.altKey)&&gState!=='playing') toggleFullscreen();
+});
+
+// ─── Toast / loading  ─────────────────────────────────────────
+function toast(msg,ms=2500){
+  const e=el('toast'); if(!e) return;
+  e.textContent=msg; e.classList.add('show');
+  clearTimeout(e._t); e._t=setTimeout(()=>e.classList.remove('show'),ms);
+}
+function showLoading(msg='Loading…'){ const e=el('scr-loading'); if(e){e.querySelector('.load-txt').textContent=msg;e.style.display='flex';} }
+function hideLoading(){ const e=el('scr-loading'); if(e) e.style.display='none'; }
+
+// ─── Fullscreen support  ─────────────────────────────────────
+function toggleFullscreen(){
+  if(!document.fullscreenElement){
+    document.documentElement.requestFullscreen?.().catch(e=>console.warn('Fullscreen failed',e));
+  } else {
+    document.exitFullscreen?.();
+  }
+}
+function applyFullscreen(){
+  if(S.fullscreen && !document.fullscreenElement){
+    document.documentElement.requestFullscreen?.().catch(e=>console.warn('Fullscreen failed',e));
+  } else if(!S.fullscreen && document.fullscreenElement){
+    document.exitFullscreen?.();
+  }
+}
+
+// ─── Settings modal open/close  ────────────────────────────────
+function openSettings(){ el('settings-modal').classList.add('vis'); }
+function closeSettings(){ el('settings-modal').classList.remove('vis'); }
+
+// ─── Button wiring  ──────────────────────────────────────────
+window.addEventListener('rhythia-play',startGame);
+el('btn-resume')?.addEventListener('click',resumeGame);
+el('btn-restart')?.addEventListener('click',startGame);
+el('btn-giveup')?.addEventListener('click',toMenu);
+el('btn-retry')?.addEventListener('click',startGame);
+el('btn-tomenu')?.addEventListener('click',toMenu);
+el('settings-close')?.addEventListener('click',closeSettings);
+['btn-settings-menu','btn-settings-play','btn-settings-pause'].forEach(id=>{
+  el(id)?.addEventListener('click',openSettings);
+});
+// Settings menu nav button opens settings
+el('btn-nav-settings')?.addEventListener('click',openSettings);
+
+// ─── Helpers  ────────────────────────────────────────────────
+const wait = ms => new Promise(r=>setTimeout(r,ms));
+
+// Util.String.PadMagnitude — inserts commas every 3 digits
+function padMag(n){ return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,','); }
+
+// Results parallax state (Results.cs _Process)
+let rMouseX=0, rMouseY=0, rHolderX=0, rHolderY=0;
+document.addEventListener('mousemove',e=>{ rMouseX=e.clientX; rMouseY=e.clientY; });
+
+// ─── Boot  ───────────────────────────────────────────────────
+// ─── Jukebox (menu music preview) ─────────────────────────────
+// Mirrors SoundManager.PlayJukebox behaviour in MainMenu.cs
+let jukeboxSrc=null, jukeboxStart=0, jukeboxPaused=false, jukeboxOffset=0, jukeboxMapIdx=-1;
+
+function jukeboxPlay(idx, offset=0){
+  if(!maps.length) return;
+  idx = ((idx % maps.length) + maps.length) % maps.length;  // wrap
+  const m = maps[idx];
+  if(!m.audio){
+    jukeboxMapIdx=idx; setT('jukebox-title','(no audio)');
+    // Auto-advance past maps with no audio after a short delay
+    setTimeout(()=>{ if(!jukeboxPaused && gState!=='playing') jukeboxPlay(idx+1,0); }, 1500);
+    return;
+  }
+  ensureACtx();
+  const doPlay = () => {
+    // Stop current
+    try{ jukeboxSrc && jukeboxSrc.stop(); }catch{}
+    jukeboxSrc = actx.createBufferSource();
+    jukeboxSrc.buffer = m.audio;
+    jukeboxSrc.playbackRate.value = 1;
+    jukeboxSrc.connect(musicG);
+    const safeOffset = Math.max(0, Math.min(offset, m.audio.duration - 0.01));
+    jukeboxSrc.start(0, safeOffset);
+    jukeboxStart = actx.currentTime - safeOffset;
+    jukeboxOffset = safeOffset;
+    jukeboxPaused = false;
+    jukeboxMapIdx = idx;
+    jukeboxSrc.onended = () => {
+      // Auto-advance to next map when song ends (SoundManager.Song.Finished -> JukeboxIndex++)
+      if(!jukeboxPaused && gState!=='playing') jukeboxPlay(jukeboxMapIdx + 1, 0);
+    };
+    // Update UI
+    const title = (m.meta.Artist ? m.meta.Artist+' - ' : '') + (m.meta.Title||'?');
+    setT('jukebox-title', title);
+    const pb = el('juke-play');
+    if(pb) pb.textContent = '⏸';
+  };
+  if(actx.state==='suspended') actx.resume().then(doPlay);
+  else doPlay();
+}
+
+function jukeboxPause(){
+  if(!jukeboxSrc || jukeboxPaused) return;
+  jukeboxOffset = actx.currentTime - jukeboxStart;
+  try{ jukeboxSrc.stop(); }catch{}
+  jukeboxPaused = true;
+  const pb = el('juke-play');
+  if(pb) pb.textContent = '▶';
+}
+
+function jukeboxResume(){
+  if(!jukeboxPaused) return;
+  jukeboxPlay(jukeboxMapIdx, jukeboxOffset);
+}
+
+function jukeboxStop(){
+  try{ jukeboxSrc && jukeboxSrc.stop(); }catch{}
+  jukeboxSrc = null; jukeboxPaused = false;
+}
+
+function setupJukebox(){
+  el('juke-play')?.addEventListener('click', ()=>{
+    if(jukeboxPaused) jukeboxResume();
+    else jukeboxPause();
+  });
+  el('juke-skip')?.addEventListener('click', ()=>{ jukeboxPlay(jukeboxMapIdx+1, 0); });
+  el('juke-rewind')?.addEventListener('click', ()=>{
+    // If >3s in, restart current; else go to previous
+    const pos = jukeboxSrc && !jukeboxPaused ? actx.currentTime - jukeboxStart : jukeboxOffset;
+    if(pos > 3) jukeboxPlay(jukeboxMapIdx, 0);
+    else jukeboxPlay(jukeboxMapIdx - 1, 0);
+  });
+}
+
+async function boot(){
+  loadProfiles();
+  loadBuiltin();
+  await loadPersistedMaps();
+  applySettings();
+  populateSettings();
+  wireSettings();
+  syncPlaySliders();
+  setupMods();
+  setupImport();
+  setupSearch();
+  setupJukebox();
+  setGameCursor(false);   // start in menu — OS cursor on, 3D cursor off
+  el('scr-loading').style.display='none';
+  el('scr-menu').style.display='block';
+  R.render(scene,cam);
+  // Auto-play built-in map if available (SoundManager AutoplayJukebox)
+  if(S.autojukeboxStart && maps.length && maps[0].builtin){
+    ensureBuiltinAudio().then(()=>{
+      if(gState==='menu') jukeboxPlay(0, 0);
+    });
+  }
+  idleLoop();
+}
+boot();
